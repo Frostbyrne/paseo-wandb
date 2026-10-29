@@ -3,6 +3,7 @@ import type { WandbRun } from "../shared/wandb";
 
 export const SCREEN_ID = "runs";
 export const PANEL_ID = "runs";
+export const REPORTS_ID = "reports";
 
 let client: PluginClientContext | null = null;
 

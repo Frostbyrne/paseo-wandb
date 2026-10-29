@@ -5,14 +5,15 @@ import {
   isActive,
   runKey,
   type RunHistory,
-  type RunState,
   type Series,
+  type WandbProject,
   type WandbRun,
   type WandbStatus,
   type runHistoryRpc,
   type wandbStatusRpc,
 } from "../shared/wandb";
 import { appUrl, batched, type Credentials, graphql, loadCredentials, WandbError } from "./api";
+import { isChartKey, numberOrNull, parseTime, RUN_FIELDS, type RawRun, toRun } from "./convert";
 import { RunLinker } from "./links";
 
 // Every open surface polls; this keeps several windows and hosts to one round of W&B calls.
@@ -28,39 +29,21 @@ const SPARK_SAMPLES = 40;
 const HISTORY_SAMPLES = 300;
 const MAX_CHART_KEYS = 48;
 
-const RUN_STATES = new Set<RunState>(["running", "pending", "finished", "failed", "crashed", "killed", "preempted"]);
-
 interface Viewer {
   username: string;
   entities: string[];
 }
 
-interface RawRun {
-  name: string;
-  displayName: string | null;
-  state: string | null;
-  createdAt: string;
-  heartbeatAt: string | null;
-  host: string | null;
-  group: string | null;
-  jobType: string | null;
-  summaryMetrics: string | null;
-}
-
 const linker = new RunLinker();
 let viewerCache: { at: number; baseUrl: string; viewer: Viewer } | null = null;
-let projectsCache: { at: number; baseUrl: string; projects: { entity: string; project: string }[] } | null = null;
+let projectsCache: { at: number; baseUrl: string; projects: WandbProject[] } | null = null;
 let statusCache: { at: number; status: WandbStatus } | null = null;
 let inFlight: Promise<WandbStatus> | null = null;
 const historyCache = new Map<string, { at: number; history: RunHistory }>();
 const labelCache = new Map<string, { at: number; label: string | null }>();
 let paseo: PluginHandlerContext["paseo"] | null = null;
 
-/** W&B returns UTC times without a zone. */
-const parseTime = (value: string | null) => (value ? Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value}Z`) : NaN);
-const isoTime = (value: string | null) => (value && Number.isFinite(parseTime(value)) ? new Date(parseTime(value)).toISOString() : null);
-
-async function getViewer(credentials: Credentials): Promise<Viewer> {
+export async function getViewer(credentials: Credentials): Promise<Viewer> {
   if (viewerCache && viewerCache.baseUrl === credentials.baseUrl && Date.now() - viewerCache.at < VIEWER_CACHE_MS) {
     return viewerCache.viewer;
   }
@@ -74,55 +57,49 @@ async function getViewer(credentials: Credentials): Promise<Viewer> {
   return viewer;
 }
 
-async function getProjects(credentials: Credentials, entities: string[]) {
+/** Every project of the viewer's entities, most recently active first. */
+export async function getProjects(credentials: Credentials, entities: string[]): Promise<WandbProject[]> {
   if (projectsCache && projectsCache.baseUrl === credentials.baseUrl && Date.now() - projectsCache.at < PROJECTS_CACHE_MS) {
     return projectsCache.projects;
   }
-  const results = await batched<string, { edges: { node: { name: string } }[] }>(
+  const results = await batched<string, { edges: { node: { name: string; runCount: number | null; lastActive: string | null } }[] }>(
     credentials,
     entities,
     10,
     (index) => `$e${index}: String!`,
-    (index) => `models(entityName: $e${index}, first: 100) { edges { node { name } } }`,
+    (index) => `models(entityName: $e${index}, first: 100) { edges { node { name runCount lastActive } } }`,
     (entity, index) => ({ [`e${index}`]: entity }),
   );
-  const projects = entities.flatMap((entity, index) =>
-    (results[index]?.edges ?? []).map((edge) => ({ entity, project: edge.node.name })),
-  );
+  const projects = entities
+    .flatMap((entity, index) =>
+      (results[index]?.edges ?? []).map(({ node }) => ({
+        entity,
+        project: node.name,
+        runCount: node.runCount ?? null,
+        lastActive: node.lastActive && Number.isFinite(parseTime(node.lastActive)) ? new Date(parseTime(node.lastActive)).toISOString() : null,
+      })),
+    )
+    .sort((a, b) => (b.lastActive ?? "").localeCompare(a.lastActive ?? ""));
   projectsCache = { at: Date.now(), baseUrl: credentials.baseUrl, projects };
   return projects;
 }
 
-function parseSummary(text: string | null): Record<string, unknown> {
-  if (!text) return {};
-  try {
-    const value = JSON.parse(text) as unknown;
-    return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  } catch {
-    return {};
+/** The daemon's credentials, or the error every handler reports without them. */
+export async function requireCredentials(): Promise<Credentials> {
+  const credentials = await loadCredentials();
+  if (!credentials) {
+    throw new WandbError("No W&B API key. Run `wandb login` on the daemon machine or set WANDB_API_KEY for the daemon.");
   }
+  return credentials;
 }
 
-const isChartKey = (key: string) => !key.startsWith("_") && !key.startsWith("system/") && !key.startsWith("system.");
-
-/** The metric a list row shows: a loss if there is one, then reward, then accuracy. */
-function pickHeadline(summary: Record<string, unknown>): { key: string; value: number } | null {
-  const rank = (key: string) => {
-    const leaf = key.split("/").pop()!.toLowerCase();
-    if (leaf === "loss") return key.startsWith("train") || !key.includes("/") ? 0 : 1;
-    if (leaf.includes("loss")) return 2;
-    if (leaf.includes("reward")) return 3;
-    if (leaf.includes("acc")) return 4;
-    return 9;
-  };
-  const candidates = Object.entries(summary)
-    .filter((entry): entry is [string, number] => isChartKey(entry[0]) && typeof entry[1] === "number" && Number.isFinite(entry[1]))
-    .sort(([a], [b]) => rank(a) - rank(b) || a.length - b.length || a.localeCompare(b));
-  return candidates[0] ? { key: candidates[0][0], value: candidates[0][1] } : null;
+/** Remembers the daemon session from any handler, for workspace lookups. */
+export function useHandlerContext(context: PluginHandlerContext) {
+  paseo = context.paseo;
 }
 
 /** `project › workspace` labels for the linked workspaces; null for ones the daemon no longer has. */
-async function workspaceLabels(ids: string[]): Promise<Map<string, string | null>> {
+export async function workspaceLabels(ids: string[]): Promise<Map<string, string | null>> {
   const labels = new Map<string, string | null>();
   await Promise.all(
     [...new Set(ids)].map(async (id) => {
@@ -143,8 +120,6 @@ async function workspaceLabels(ids: string[]): Promise<Map<string, string | null
   return labels;
 }
 
-const numberOrNull = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : null);
-
 async function fetchRuns(credentials: Credentials, projects: { entity: string; project: string }[]) {
   const filters = JSON.stringify({
     $or: [{ state: "running" }, { state: "pending" }, { heartbeatAt: { $gt: new Date(Date.now() - RECENT_MS).toISOString() } }],
@@ -155,7 +130,7 @@ async function fetchRuns(credentials: Credentials, projects: { entity: string; p
     25,
     (index) => `$e${index}: String!, $p${index}: String!`,
     (index) =>
-      `project(name: $p${index}, entityName: $e${index}) { runs(first: ${RUNS_PER_PROJECT}, order: "-created_at", filters: $f) { edges { node { name displayName state createdAt heartbeatAt host group jobType summaryMetrics } } } }`,
+      `project(name: $p${index}, entityName: $e${index}) { runs(first: ${RUNS_PER_PROJECT}, order: "-created_at", filters: $f) { edges { node { ${RUN_FIELDS} } } } }`,
     ({ entity, project }, index) => ({ [`e${index}`]: entity, [`p${index}`]: project }),
     { declarations: "$f: JSONString", variables: { f: filters } },
   );
@@ -192,38 +167,12 @@ async function fetchRecent(credentials: Credentials, runs: WandbRun[]): Promise<
 }
 
 async function loadStatus(): Promise<WandbStatus> {
-  const credentials = await loadCredentials();
-  if (!credentials) {
-    throw new WandbError("No W&B API key. Run `wandb login` on the daemon machine or set WANDB_API_KEY for the daemon.");
-  }
+  const credentials = await requireCredentials();
   const viewer = await getViewer(credentials);
   const projects = await getProjects(credentials, viewer.entities);
   const app = appUrl(credentials.baseUrl);
 
-  const runs: WandbRun[] = (await fetchRuns(credentials, projects)).map(({ entity, project, raw }) => {
-    const summary = parseSummary(raw.summaryMetrics);
-    const state = (raw.state ?? "unknown") as RunState;
-    const headline = pickHeadline(summary);
-    return {
-      key: runKey(entity, project, raw.name),
-      entity,
-      project,
-      id: raw.name,
-      name: raw.displayName || raw.name,
-      state: RUN_STATES.has(state) ? state : "unknown",
-      createdAt: isoTime(raw.createdAt) ?? raw.createdAt,
-      heartbeatAt: isoTime(raw.heartbeatAt),
-      runtime: numberOrNull(summary._runtime) ?? numberOrNull(summary["_wandb.runtime"]),
-      step: numberOrNull(summary._step),
-      host: raw.host,
-      group: raw.group,
-      jobType: raw.jobType,
-      url: `${app}/${encodeURIComponent(entity)}/${encodeURIComponent(project)}/runs/${encodeURIComponent(raw.name)}`,
-      link: null,
-      workspaceLabel: null,
-      headline: headline ? { ...headline, recent: [] } : null,
-    };
-  });
+  const runs: WandbRun[] = (await fetchRuns(credentials, projects)).map(({ entity, project, raw }) => toRun(entity, project, raw, app, false));
   runs.sort(
     (a, b) =>
       Number(isActive(b)) - Number(isActive(a)) ||
@@ -236,17 +185,34 @@ async function loadStatus(): Promise<WandbStatus> {
     fetchRecent(credentials, runs).catch((error) => console.error("Could not fetch recent values", error)),
   ]);
   for (const run of runs) run.link = links.get(run.key) ?? null;
-  const labels = await workspaceLabels(runs.flatMap((run) => (run.link?.workspaceId ? [run.link.workspaceId] : [])));
-  for (const run of runs) run.workspaceLabel = run.link?.workspaceId ? (labels.get(run.link.workspaceId) ?? null) : null;
+  await labelRuns(runs);
 
   return { fetchedAt: new Date().toISOString(), user: viewer.username, appUrl: app, runs, error: null };
+}
+
+/** Makes the next status call refetch, after an action changed a run. */
+export function forgetStatus() {
+  statusCache = null;
+}
+
+/** Fills `workspaceLabel` for runs that have a linked workspace. */
+export async function labelRuns(runs: WandbRun[]): Promise<void> {
+  const labels = await workspaceLabels(runs.flatMap((run) => (run.link?.workspaceId ? [run.link.workspaceId] : [])));
+  for (const run of runs) run.workspaceLabel = run.link?.workspaceId ? (labels.get(run.link.workspaceId) ?? null) : null;
+}
+
+/** Saved links for runs from queries, without scanning processes or transcripts. */
+export async function savedLinks(runs: WandbRun[]): Promise<void> {
+  const links = await linker.lookup(runs.map((run) => run.key));
+  for (const run of runs) run.link = links.get(run.key) ?? null;
+  await labelRuns(runs);
 }
 
 export async function getWandbStatus(
   { refresh }: RpcInput<typeof wandbStatusRpc>,
   context: PluginHandlerContext,
 ): Promise<RpcOutput<typeof wandbStatusRpc>> {
-  paseo = context.paseo;
+  useHandlerContext(context);
   if (!refresh && statusCache && Date.now() - statusCache.at < STATUS_CACHE_MS) return statusCache.status;
   inFlight ??= loadStatus()
     .then((status) => {
@@ -274,13 +240,15 @@ export async function getWandbStatus(
   return inFlight;
 }
 
-function toSeries(key: string, xKey: string, xLabel: string, rows: Record<string, unknown>[], scaleX = 1): Series {
+type HistoryRow = Record<string, unknown>;
+
+function toSeries(key: string, valueKey: string, rows: HistoryRow[], withStep: boolean): Series {
   const points = rows
-    .map((row) => [numberOrNull(row[xKey]), numberOrNull(row[key])] as const)
-    .filter((pair): pair is readonly [number, number] => pair[0] !== null && pair[1] !== null)
-    .map(([x, y]) => [x * scaleX, y] as [number, number])
-    .sort((a, b) => a[0] - b[0]);
-  return { key, xLabel, points };
+    .map((row) => [withStep ? numberOrNull(row._step) : null, numberOrNull(row._runtime), numberOrNull(row._timestamp), numberOrNull(row[valueKey])] as const)
+    .filter((point): point is readonly [number | null, number | null, number | null, number] => point[3] !== null && (point[0] ?? point[1] ?? point[2]) !== null)
+    .map((point) => [...point] as [number | null, number | null, number | null, number])
+    .sort((a, b) => (a[0] ?? a[1] ?? a[2] ?? 0) - (b[0] ?? b[1] ?? b[2] ?? 0));
+  return { key, points };
 }
 
 /** GPU, CPU, and memory use from the run's system events. */
@@ -288,12 +256,12 @@ function systemSeries(events: string[]): Series[] {
   const rows = events
     .map((event) => {
       try {
-        return JSON.parse(event) as Record<string, unknown>;
+        return JSON.parse(event) as HistoryRow;
       } catch {
         return null;
       }
     })
-    .filter((row): row is Record<string, unknown> => row !== null);
+    .filter((row): row is HistoryRow => row !== null);
   const keys = new Set<string>();
   for (const row of rows) for (const key of Object.keys(row)) keys.add(key);
   const wanted = [...keys]
@@ -306,9 +274,7 @@ function systemSeries(events: string[]): Series[] {
       .replace(/^system\.gpu\.(\d+)\.powerWatts$/, "GPU $1 power (W)")
       .replace(/^system\.cpu$/, "CPU (%)")
       .replace(/^system\.memory_percent$/, "System memory (%)");
-  return wanted
-    .map((key) => ({ ...toSeries(key, "_runtime", "minutes", rows, 1 / 60), key: label(key) }))
-    .filter((series) => series.points.length > 0);
+  return wanted.map((key) => toSeries(label(key), key, rows, false)).filter((series) => series.points.length > 0);
 }
 
 export async function getRunHistory({ entity, project, id }: RpcInput<typeof runHistoryRpc>): Promise<RpcOutput<typeof runHistoryRpc>> {
@@ -316,8 +282,7 @@ export async function getRunHistory({ entity, project, id }: RpcInput<typeof run
   const cached = historyCache.get(key);
   if (cached && Date.now() - cached.at < HISTORY_CACHE_MS) return cached.history;
 
-  const credentials = await loadCredentials();
-  if (!credentials) throw new Error("No W&B API key on the daemon machine.");
+  const credentials = await requireCredentials();
   const location = { e: entity, p: project, r: id };
   const keysData = await graphql<{ project: { run: { historyKeys: { keys?: Record<string, { typeCounts?: { type: string }[] }> } | null } | null } | null }>(
     credentials,
@@ -332,8 +297,9 @@ export async function getRunHistory({ entity, project, id }: RpcInput<typeof run
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const chartKeys = numericKeys.slice(0, MAX_CHART_KEYS);
 
-  const specs = chartKeys.map((name) => JSON.stringify({ keys: ["_step", name], samples: HISTORY_SAMPLES }));
-  const data = await graphql<{ project: { run: { sampledHistory?: Record<string, unknown>[][]; events: string[] } | null } | null }>(
+  // Runtime and wall time ride along so the client can switch the x axis without refetching.
+  const specs = chartKeys.map((name) => JSON.stringify({ keys: ["_step", "_runtime", "_timestamp", name], samples: HISTORY_SAMPLES }));
+  const data = await graphql<{ project: { run: { sampledHistory?: HistoryRow[][]; events: string[] } | null } | null }>(
     credentials,
     `query($e: String!, $p: String!, $r: String!${specs.length ? ", $s: [JSONString!]!" : ""}) { project(name: $p, entityName: $e) { run(name: $r) { ${specs.length ? "sampledHistory(specs: $s)" : ""} events(samples: ${HISTORY_SAMPLES}) } } }`,
     specs.length ? { ...location, s: specs } : location,
@@ -341,12 +307,12 @@ export async function getRunHistory({ entity, project, id }: RpcInput<typeof run
   const sampled = data.project?.run?.sampledHistory ?? [];
   const history: RunHistory = {
     fetchedAt: new Date().toISOString(),
-    metrics: chartKeys.map((name, index) => toSeries(name, "_step", "step", sampled[index] ?? [])),
+    metrics: chartKeys.map((name, index) => toSeries(name, name, sampled[index] ?? [], true)),
     system: systemSeries(data.project?.run?.events ?? []),
     omittedKeys: numericKeys.length - chartKeys.length,
   };
   historyCache.set(key, { at: Date.now(), history });
-  // Drop finished lookups so the cache does not grow with every run ever opened.
+  // Drop stale entries so the cache does not grow with every run ever opened.
   for (const [cachedKey, entry] of historyCache) {
     if (Date.now() - entry.at > 10 * 60_000) historyCache.delete(cachedKey);
   }

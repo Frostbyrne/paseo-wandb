@@ -1,7 +1,7 @@
 {
   "name": "paseo-wandb",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows your active Weights & Biases runs in the Paseo sidebar and charts them in a tab beside the agent that started them.",
   "license": "GPL-3.0-or-later",
   "repository": {

@@ -3,7 +3,7 @@ import { ExternalLink, Loading, ScrollView, SidebarRow, useToast } from "@getpas
 import { useEffect, useRef } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { WandbRun } from "../shared/wandb";
-import { openRunInWorkspace, SCREEN_ID } from "./navigation";
+import { openRunInWorkspace, REPORTS_ID, SCREEN_ID } from "./navigation";
 import { RunList, StatusSummary } from "./runs";
 import { diffRuns, summarize, useNow, useWandbStatus } from "./state";
 
@@ -55,6 +55,16 @@ export function WandbPopover({ theme, layout, openScreen, close }: PluginPopover
         >
           <Text style={{ color: theme.colors.accent, fontSize: 12, fontWeight: "600" }}>Details</Text>
         </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Open W&B reports"
+          onPress={() => {
+            close();
+            openScreen({ screenId: REPORTS_ID });
+          }}
+        >
+          <Text style={{ color: theme.colors.accent, fontSize: 12, fontWeight: "600" }}>Reports</Text>
+        </Pressable>
         <ExternalLink href={data?.appUrl ?? "https://wandb.ai"} accessibilityLabel="Open Weights & Biases">
           <Text style={{ color: theme.colors.accent, fontSize: 12, fontWeight: "600" }}>W&B home</Text>
         </ExternalLink>
@@ -74,7 +84,7 @@ export function WandbSidebarItem({ theme, currentScreen, openPopover }: PluginSi
     const summary = summarize(data, now);
     if (summary.active > 0) {
       label = `W&B: ${summary.active} running`;
-      dot = summary.stale > 0 ? theme.colors.statusWarning : theme.colors.statusSuccess;
+      dot = summary.nonFinite > 0 ? theme.colors.statusDanger : summary.stale > 0 ? theme.colors.statusWarning : theme.colors.statusSuccess;
     } else {
       label = "W&B: idle";
       if (summary.ended > 0) dot = theme.colors.foregroundMuted;

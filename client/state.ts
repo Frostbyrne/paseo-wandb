@@ -1,8 +1,8 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { isActive, type RunState, runHistoryRpc, type WandbRun, type WandbStatus, wandbStatusRpc } from "../shared/wandb";
+import { isActive, type RunState, runsByKeyRpc, type WandbRun, type WandbStatus, wandbStatusRpc } from "../shared/wandb";
 
 const STATUS_KEY = ["wandb-status"] as const;
 const POLL_MS = 30_000;
@@ -32,15 +32,17 @@ export function useRefreshWandb() {
   });
 }
 
-export function useRunHistory(run: WandbRun | null) {
-  const fetchHistory = useRpc(runHistoryRpc);
-  const active = run ? isActive(run) : false;
+/** Full rows, with config and summary, for runs picked by key; earlier rows stay up while refetching. */
+export function useRunsByKey(keys: string[], anyActive: boolean) {
+  const fetchRuns = useRpc(runsByKeyRpc);
+  const sorted = [...new Set(keys)].sort();
   return useQuery({
-    queryKey: ["wandb-history", run?.key ?? null],
-    queryFn: () => fetchHistory({ entity: run!.entity, project: run!.project, id: run!.id }),
-    enabled: run !== null,
-    refetchInterval: active ? POLL_MS : false,
-    staleTime: active ? 0 : Infinity,
+    queryKey: ["wandb-runs-by-key", sorted],
+    queryFn: () => fetchRuns({ keys: sorted }),
+    enabled: sorted.length > 0,
+    placeholderData: keepPreviousData,
+    // Live runs refresh as often as their charts; progress, GPU use, and health come from here.
+    refetchInterval: anyActive ? 15_000 : false,
     retry: 1,
   });
 }
@@ -59,8 +61,12 @@ const ENDED_BADLY = new Set<RunState>(["crashed", "failed", "killed", "preempted
 export const isStale = (run: WandbRun, now: number) =>
   run.state === "running" && run.heartbeatAt !== null && now - Date.parse(run.heartbeatAt) > STALE_HEARTBEAT_MS;
 
+/** A live run that is heartbeating but in trouble: NaN metrics or no new steps. */
+export const isUnhealthy = (run: WandbRun) => isActive(run) && (run.nonFinite.length > 0 || run.stalledSeconds !== null);
+
 export function stateColor(run: WandbRun, theme: PluginTheme, now: number): string {
-  if (isStale(run, now)) return theme.colors.statusWarning;
+  if (isActive(run) && run.nonFinite.length > 0) return theme.colors.statusDanger;
+  if (isStale(run, now) || run.stalledSeconds !== null) return theme.colors.statusWarning;
   if (run.state === "running") return theme.colors.statusSuccess;
   if (run.state === "pending") return theme.colors.statusWarning;
   if (ENDED_BADLY.has(run.state)) return theme.colors.statusDanger;
@@ -70,8 +76,10 @@ export function stateColor(run: WandbRun, theme: PluginTheme, now: number): stri
 export interface Summary {
   active: number;
   ended: number;
-  /** Running runs whose heartbeat stopped. */
+  /** Running runs whose heartbeat stopped or that stopped logging. */
   stale: number;
+  /** Running runs logging NaN or infinite metrics. */
+  nonFinite: number;
   /** Runs that crashed or failed within the alert window. */
   failedRecently: number;
 }
@@ -81,7 +89,8 @@ export function summarize(status: WandbStatus, now: number): Summary {
   return {
     active: active.length,
     ended: status.runs.length - active.length,
-    stale: active.filter((run) => isStale(run, now)).length,
+    stale: active.filter((run) => isStale(run, now) || run.stalledSeconds !== null).length,
+    nonFinite: active.filter((run) => run.nonFinite.length > 0).length,
     failedRecently: status.runs.filter(
       (run) => ENDED_BADLY.has(run.state) && now - Date.parse(run.heartbeatAt ?? run.createdAt) < FAILURE_ALERT_MS,
     ).length,
@@ -98,6 +107,7 @@ export function duration(seconds: number): string {
 }
 
 export function stateText(run: WandbRun, now: number): string {
+  if (run.stalledSeconds !== null && !isStale(run, now)) return `running, no new steps for ${duration(run.stalledSeconds)}`;
   if (isStale(run, now)) return `no heartbeat for ${duration((now - Date.parse(run.heartbeatAt!)) / 1000)}`;
   if (run.state === "running") return `running ${duration((now - Date.parse(run.createdAt)) / 1000)}`;
   if (run.state === "pending") return "pending";
@@ -118,6 +128,26 @@ export function formatValue(value: number): string {
   }
   if (magnitude < 1e-3) return value.toExponential(2);
   return String(Number(value.toPrecision(4)));
+}
+
+/** Thousands separators in the integer part of a plain number. */
+function groupDigits(text: string): string {
+  const [whole, fraction] = text.split(".");
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return fraction === undefined ? grouped : `${grouped}.${fraction}`;
+}
+
+/** Two ends of a range, with enough digits that they differ: 1,234,500 to 1,234,900 rather than 1.23M to 1.23M. */
+export function formatPair(low: number, high: number): [string, string] {
+  let pair: [string, string] = [formatValue(low), formatValue(high)];
+  for (let digits = 4; pair[0] === pair[1] && low !== high && digits <= 12; digits++) {
+    const precise = (value: number) => {
+      const text = String(Number(value.toPrecision(digits)));
+      return /e/.test(text) ? value.toPrecision(digits) : groupDigits(text);
+    };
+    pair = [precise(low), precise(high)];
+  }
+  return pair;
 }
 
 export const stepText = (run: WandbRun) => (run.step != null ? `step ${formatValue(run.step)}` : null);
@@ -144,6 +174,12 @@ export function diffRuns(previous: WandbRun[], next: WandbRun[]): Change[] {
         message: `W&B: ${run.name} ${run.state}`,
         variant: ENDED_BADLY.has(run.state) ? "warning" : run.state === "finished" ? "success" : "default",
       });
+    } else if (isActive(run)) {
+      const newNonFinite = run.nonFinite.filter((key) => !old.nonFinite.includes(key));
+      if (newNonFinite.length) changes.push({ message: `W&B: ${run.name} logged NaN/Inf in ${newNonFinite.join(", ")}`, variant: "warning" });
+      if (run.stalledSeconds !== null && old.stalledSeconds === null) {
+        changes.push({ message: `W&B: ${run.name} has logged no new steps for ${duration(run.stalledSeconds)}`, variant: "warning" });
+      }
     }
   }
   return changes;

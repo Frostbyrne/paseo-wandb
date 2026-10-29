@@ -1,10 +1,11 @@
 import type { PluginTheme } from "@getpaseo/plugin";
-import { copyText, ExternalLink, Loading, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, ExternalLink, useToast } from "@getpaseo/plugin/client/ui";
 import { useMemo } from "react";
 import { Pressable, Text, View } from "react-native";
-import type { Series, WandbRun, WandbStatus } from "../shared/wandb";
-import { ChartGrid, Sparkline } from "./chart";
-import { duration, formatValue, stateColor, stateText, stepText, summarize, useRefreshWandb, useRunHistory, whereText } from "./state";
+import type { WandbRun, WandbStatus } from "../shared/wandb";
+import { Sparkline } from "./chart";
+import { HealthBadges, LiveLine, StopButton } from "./live";
+import { duration, formatValue, stateColor, stateText, stepText, summarize, useRefreshWandb, whereText } from "./state";
 
 export function useStyles(theme: PluginTheme) {
   return useMemo(
@@ -41,7 +42,8 @@ export function StatusSummary({ theme, status, now }: { theme: PluginTheme; stat
   const refresh = useRefreshWandb();
   const updated = status.fetchedAt ? duration((now - Date.parse(status.fetchedAt)) / 1000) : null;
   const parts = [`${summary.active} running`, `${summary.ended} ended in the last 6h`];
-  if (summary.stale > 0) parts.push(`${summary.stale} without heartbeat`);
+  if (summary.stale > 0) parts.push(`${summary.stale} quiet`);
+  if (summary.nonFinite > 0) parts.push(`${summary.nonFinite} with NaN/Inf`);
   return (
     <View style={styles.column}>
       <View style={styles.spread}>
@@ -135,6 +137,8 @@ export function RunCard({
           <Sparkline values={run.headline.recent} width={72} height={16} color={theme.colors.accent} />
         ) : null}
       </View>
+      <LiveLine theme={theme} run={run} />
+      <HealthBadges theme={theme} run={run} />
       <OriginText theme={theme} run={run} />
       <View style={{ ...styles.row, gap: 14, paddingTop: 2 }}>
         <Pressable accessibilityRole="button" accessibilityLabel={`${openLabel} for ${run.name}`} onPress={() => onOpen(run)}>
@@ -146,6 +150,7 @@ export function RunCard({
         <Pressable accessibilityRole="button" accessibilityLabel={`Copy the URL of ${run.name}`} onPress={copyUrl}>
           <Text style={styles.link}>Copy URL</Text>
         </Pressable>
+        <StopButton theme={theme} run={run} />
       </View>
     </View>
   );
@@ -183,84 +188,6 @@ export function RunList({
           openLabel={openLabel}
         />
       ))}
-    </View>
-  );
-}
-
-/** Groups keys like W&B does: by the part before the first slash, ungrouped keys first. */
-function sections(metrics: Series[]): { title: string; series: Series[] }[] {
-  const groups = new Map<string, Series[]>();
-  for (const series of metrics) {
-    const slash = series.key.indexOf("/");
-    const title = slash > 0 ? series.key.slice(0, slash) : "";
-    groups.set(title, [...(groups.get(title) ?? []), series]);
-  }
-  return [...groups.entries()]
-    .sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)))
-    .map(([title, series]) => ({ title: title || "Charts", series }));
-}
-
-/** A run's header and all its metric and system charts. */
-export function RunCharts({ theme, run, now, compact }: { theme: PluginTheme; run: WandbRun; now: number; compact: boolean }) {
-  const styles = useStyles(theme);
-  const history = useRunHistory(run);
-  const copyUrl = useCopyUrl(run);
-  const groups = useMemo(() => sections(history.data?.metrics ?? []), [history.data]);
-  const color = stateColor(run, theme, now);
-  const facts = [
-    stepText(run),
-    run.jobType ? `job ${run.jobType}` : null,
-    `id ${run.id}`,
-  ].filter(Boolean);
-  return (
-    <View style={{ gap: 16 }}>
-      <View style={{ gap: 4 }}>
-        <View style={styles.row}>
-          <View style={{ ...styles.dot, backgroundColor: color }} />
-          <Text style={{ ...styles.name, fontSize: compact ? 16 : 18 }} numberOfLines={1}>
-            {run.name}
-          </Text>
-        </View>
-        <Text style={{ ...styles.muted, color }}>{stateText(run, now)}</Text>
-        <Text style={styles.muted}>{whereText(run)}</Text>
-        <Text style={styles.muted}>{facts.join(" · ")}</Text>
-        <OriginText theme={theme} run={run} />
-        <View style={{ ...styles.row, gap: 14, paddingTop: 4 }}>
-          <ExternalLink href={run.url} accessibilityLabel={`Open ${run.name} in W&B`}>
-            <Text style={styles.link}>Open in W&B</Text>
-          </ExternalLink>
-          <Pressable accessibilityRole="button" accessibilityLabel={`Copy the URL of ${run.name}`} onPress={copyUrl}>
-            <Text style={styles.link}>Copy URL</Text>
-          </Pressable>
-          {history.isFetching ? <Text style={styles.muted}>Updating…</Text> : null}
-        </View>
-      </View>
-      {history.isPending ? (
-        <View style={{ height: 120 }}>
-          <Loading />
-        </View>
-      ) : history.error ? (
-        <Text style={styles.danger}>Could not load charts: {history.error.message}</Text>
-      ) : (
-        <>
-          {groups.length === 0 ? <Text style={styles.empty}>No metrics logged yet.</Text> : null}
-          {groups.map((group) => (
-            <View key={group.title} style={{ gap: 8 }}>
-              <Text style={styles.heading}>{group.title}</Text>
-              <ChartGrid theme={theme} series={group.series} compact={compact} />
-            </View>
-          ))}
-          {history.data && history.data.omittedKeys > 0 ? (
-            <Text style={styles.muted}>{history.data.omittedKeys} more metrics are not charted here; open the run in W&B for all of them.</Text>
-          ) : null}
-          {history.data && history.data.system.length > 0 ? (
-            <View style={{ gap: 8 }}>
-              <Text style={styles.heading}>System</Text>
-              <ChartGrid theme={theme} series={history.data.system} compact={compact} />
-            </View>
-          ) : null}
-        </>
-      )}
     </View>
   );
 }

@@ -303,6 +303,17 @@ export class RunLinker {
     return result;
   }
 
+  /** Saved links only, for runs that come from queries rather than the status poll. */
+  async lookup(keys: string[]): Promise<Map<string, RunLink>> {
+    const stored = await this.load();
+    const result = new Map<string, RunLink>();
+    for (const key of keys) {
+      const saved = stored.get(key);
+      if (saved) result.set(key, saved.link);
+    }
+    return result;
+  }
+
   private async searchTranscripts(stored: Map<string, StoredLink>, runs: LinkRequest[], sessions: ClaudeSession[]) {
     await this.transcripts.update(Math.min(...runs.map((run) => run.createdAt)) - 3600_000);
     const bySession = new Map(sessions.map((session) => [session.sessionId, session]));
