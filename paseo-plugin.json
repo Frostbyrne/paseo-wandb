@@ -1,0 +1,12 @@
+{
+  "id": "paseo-wandb",
+  "name": "Weights & Biases runs",
+  "description": "Shows your active Weights & Biases runs in the Paseo sidebar and charts them in a tab beside the agent that started them.",
+  "media": [
+    "media/workspace-tab.png",
+    "media/popover.png"
+  ],
+  "requirements": {
+    "paseo": ">=0.13.2"
+  }
+}
