@@ -3,6 +3,8 @@ import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   isActive,
+  isLive,
+  type Logger,
   runKey,
   type RunHistory,
   type Series,
@@ -20,10 +22,11 @@ import { RunLinker } from "./links";
 const STATUS_CACHE_MS = 15_000;
 const HISTORY_CACHE_MS = 15_000;
 const VIEWER_CACHE_MS = 10 * 60_000;
-const PROJECTS_CACHE_MS = 5 * 60_000;
+// Short, so a project an agent just created shows its runs within a minute.
+const PROJECTS_CACHE_MS = 60_000;
 /** Ended runs stay listed this long after their last heartbeat. */
 const RECENT_MS = 6 * 3600_000;
-const MAX_RUNS = 30;
+const MAX_RUNS = 60;
 const RUNS_PER_PROJECT = 50;
 const SPARK_SAMPLES = 40;
 const HISTORY_SAMPLES = 300;
@@ -51,7 +54,8 @@ export async function getViewer(credentials: Credentials): Promise<Viewer> {
     viewer: { username: string; entity: string; teams: { edges: { node: { name: string } }[] } | null } | null;
   }>(credentials, "{ viewer { username entity teams { edges { node { name } } } } }");
   if (!data.viewer) throw new WandbError("W&B did not return the account for this API key.");
-  const entities = [data.viewer.entity, ...(data.viewer.teams?.edges.map((edge) => edge.node.name) ?? [])];
+  // The default entity can be a team, so the username's personal entity is listed too.
+  const entities = [data.viewer.entity, data.viewer.username, ...(data.viewer.teams?.edges.map((edge) => edge.node.name) ?? [])];
   const viewer = { username: data.viewer.username, entities: [...new Set(entities.filter(Boolean))] };
   viewerCache = { at: Date.now(), baseUrl: credentials.baseUrl, viewer };
   return viewer;
@@ -67,7 +71,8 @@ export async function getProjects(credentials: Credentials, entities: string[]):
     entities,
     10,
     (index) => `$e${index}: String!`,
-    (index) => `models(entityName: $e${index}, first: 100) { edges { node { name runCount lastActive } } }`,
+    // The 100 most recently active projects of each entity; older ones rarely hold live runs.
+    (index) => `projects(entityName: $e${index}, first: 100, order: "-lastActive") { edges { node { name runCount lastActive } } }`,
     (entity, index) => ({ [`e${index}`]: entity }),
   );
   const projects = entities
@@ -176,18 +181,82 @@ async function loadStatus(): Promise<WandbStatus> {
   runs.sort(
     (a, b) =>
       Number(isActive(b)) - Number(isActive(a)) ||
+      Number(b.updating) - Number(a.updating) ||
       (parseTime(b.heartbeatAt) || parseTime(b.createdAt)) - (parseTime(a.heartbeatAt) || parseTime(a.createdAt)),
   );
   runs.splice(MAX_RUNS);
 
-  const [links] = await Promise.all([
+  const [{ links, loggers: found }] = await Promise.all([
     linker.resolve(runs.map((run) => ({ ...run, createdAt: parseTime(run.createdAt) }))),
-    fetchRecent(credentials, runs).catch((error) => console.error("Could not fetch recent values", error)),
+    fetchRecent(credentials, runs.filter(isLive)).catch((error) => console.error("Could not fetch recent values", error)),
   ]);
   for (const run of runs) run.link = links.get(run.key) ?? null;
+  // A run that a still-running local script created or reopened can still be added to, however
+  // long the script waits between results, though W&B shows it finished. Scripts that finish exit.
+  const fromLoggers = new Set(found.flatMap((logger) => logger.runIds));
+  for (const run of runs) if (!isActive(run) && fromLoggers.has(run.id)) run.updating = true;
+  // Paseo agents mark their processes with the agent, not the workspace; the agent knows both.
+  const agents = await agentInfo([
+    ...runs.flatMap((run) => (run.link?.agentId ? [run.link.agentId] : [])),
+    ...found.flatMap((logger) => (logger.env.agentId ? [logger.env.agentId] : [])),
+  ]);
+  for (const run of runs) {
+    const agent = run.link?.agentId ? agents.get(run.link.agentId) : undefined;
+    if (run.link && agent) run.link = { ...run.link, workspaceId: run.link.workspaceId ?? agent.workspaceId, agentName: run.link.agentName ?? agent.title };
+  }
+  for (const logger of found) {
+    const agent = logger.env.agentId ? agents.get(logger.env.agentId) : undefined;
+    if (agent) {
+      logger.env = { ...logger.env, workspaceId: logger.env.workspaceId ?? agent.workspaceId };
+      logger.agentName ??= agent.title;
+    }
+  }
+  runs.sort((a, b) => Number(isLive(b)) - Number(isLive(a)));
   await labelRuns(runs);
+  const labels = await workspaceLabels(found.flatMap((logger) => (logger.env.workspaceId ? [logger.env.workspaceId] : [])));
+  const loggers: Logger[] = found.map((logger) => ({
+    pid: logger.pid,
+    command: logger.command,
+    processCount: logger.processCount,
+    workspaceId: logger.env.workspaceId,
+    workspaceLabel: logger.env.workspaceId ? (labels.get(logger.env.workspaceId) ?? null) : null,
+    agentName: logger.agentName,
+    startedAt: new Date(logger.startedAt).toISOString(),
+    lastLogAt: logger.lastLogAt ? new Date(logger.lastLogAt).toISOString() : null,
+    runKeys: runs.filter((run) => logger.runIds.includes(run.id)).map((run) => run.key),
+    runCount: logger.runIds.length,
+  }));
 
-  return { fetchedAt: new Date().toISOString(), user: viewer.username, appUrl: app, runs, error: null };
+  return { fetchedAt: new Date().toISOString(), user: viewer.username, appUrl: app, runs, loggers, error: null };
+}
+
+const agentCache = new Map<string, { at: number; info: { workspaceId: string | null; title: string | null } | null }>();
+
+/** Workspace and title of Paseo agents, for runs their processes started. */
+async function agentInfo(ids: string[]): Promise<Map<string, { workspaceId: string | null; title: string | null }>> {
+  const result = new Map<string, { workspaceId: string | null; title: string | null }>();
+  await Promise.all(
+    [...new Set(ids)].map(async (id) => {
+      const cached = agentCache.get(id);
+      if (cached && Date.now() - cached.at < 60_000) {
+        if (cached.info) result.set(id, cached.info);
+        return;
+      }
+      if (!paseo) return;
+      try {
+        const handle = paseo.agents.ref(id);
+        await handle.refresh();
+        const agent = handle.current();
+        const info = agent ? { workspaceId: agent.workspaceId ?? null, title: agent.title ?? null } : null;
+        agentCache.set(id, { at: Date.now(), info });
+        if (info) result.set(id, info);
+      } catch (error) {
+        console.error("Could not look up agent", id, error);
+        agentCache.set(id, { at: Date.now(), info: null });
+      }
+    }),
+  );
+  return result;
 }
 
 /** Makes the next status call refetch, after an action changed a run. */
@@ -229,6 +298,7 @@ export async function getWandbStatus(
         user: previous?.user ?? null,
         appUrl: previous?.appUrl ?? "https://wandb.ai",
         runs: previous?.runs ?? [],
+        loggers: previous?.loggers ?? [],
         error: message,
       };
       statusCache = { at: Date.now(), status };

@@ -5,7 +5,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { type ReactNode, useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
-  isActive,
+  isLive,
   type ReportPanel,
   type ReportRunSet,
   type ReportSeries,
@@ -447,7 +447,7 @@ function PanelGrid({
   const allKeys = useMemo(() => runSets.flatMap((runSet) => runSet.runKeys), [runSets]);
   const rows = useRunsByKey(allKeys, false);
   const runs = useMemo(() => allKeys.flatMap((key) => rows.data?.runs.find((run) => run.key === key) ?? []), [allKeys, rows.data]);
-  const anyActive = runs.some(isActive);
+  const anyActive = runs.some(isLive);
   // Line plots take runs from each run set in turn, so every set is represented.
   const chartKeys = useMemo(() => {
     const queues = runSets.map((runSet) => [...runSet.runKeys]);

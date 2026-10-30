@@ -2,7 +2,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { isActive, type RunState, runsByKeyRpc, type WandbRun, type WandbStatus, wandbStatusRpc } from "../shared/wandb";
+import { isActive, isLive, type RunState, runsByKeyRpc, type WandbRun, type WandbStatus, wandbStatusRpc } from "../shared/wandb";
 
 const STATUS_KEY = ["wandb-status"] as const;
 const POLL_MS = 30_000;
@@ -33,7 +33,7 @@ export function useRefreshWandb() {
 }
 
 /** Full rows, with config and summary, for runs picked by key; earlier rows stay up while refetching. */
-export function useRunsByKey(keys: string[], anyActive: boolean) {
+export function useRunsByKey(keys: string[], anyLive: boolean) {
   const fetchRuns = useRpc(runsByKeyRpc);
   const sorted = [...new Set(keys)].sort();
   return useQuery({
@@ -42,9 +42,19 @@ export function useRunsByKey(keys: string[], anyActive: boolean) {
     enabled: sorted.length > 0,
     placeholderData: keepPreviousData,
     // Live runs refresh as often as their charts; progress, GPU use, and health come from here.
-    refetchInterval: anyActive ? 15_000 : false,
+    refetchInterval: anyLive ? 15_000 : false,
     retry: 1,
   });
+}
+
+/**
+ * Rows from run queries, marked updating where the status poll says so. Only the status poll sees
+ * local scripts, so it alone knows which finished runs are still being added to.
+ */
+export function useStatusLiveness(rows: WandbRun[]): WandbRun[] {
+  const { data } = useWandbStatus();
+  const live = new Set((data?.runs ?? []).filter((run) => run.updating).map((run) => run.key));
+  return rows.map((row) => (live.has(row.key) && !row.updating ? { ...row, updating: true } : row));
 }
 
 export function useNow(intervalMs: number): number {
@@ -67,7 +77,7 @@ export const isUnhealthy = (run: WandbRun) => isActive(run) && (run.nonFinite.le
 export function stateColor(run: WandbRun, theme: PluginTheme, now: number): string {
   if (isActive(run) && run.nonFinite.length > 0) return theme.colors.statusDanger;
   if (isStale(run, now) || run.stalledSeconds !== null) return theme.colors.statusWarning;
-  if (run.state === "running") return theme.colors.statusSuccess;
+  if (run.state === "running" || run.updating) return theme.colors.statusSuccess;
   if (run.state === "pending") return theme.colors.statusWarning;
   if (ENDED_BADLY.has(run.state)) return theme.colors.statusDanger;
   return theme.colors.foregroundMuted;
@@ -75,6 +85,10 @@ export function stateColor(run: WandbRun, theme: PluginTheme, now: number): stri
 
 export interface Summary {
   active: number;
+  /** Finished runs that scripts are still adding to. */
+  updating: number;
+  /** Local W&B scripts that have logged nothing yet. */
+  waiting: number;
   ended: number;
   /** Running runs whose heartbeat stopped or that stopped logging. */
   stale: number;
@@ -86,9 +100,12 @@ export interface Summary {
 
 export function summarize(status: WandbStatus, now: number): Summary {
   const active = status.runs.filter(isActive);
+  const updating = status.runs.filter((run) => !isActive(run) && run.updating).length;
   return {
     active: active.length,
-    ended: status.runs.length - active.length,
+    updating,
+    waiting: status.loggers.filter((logger) => logger.runCount === 0).length,
+    ended: status.runs.length - active.length - updating,
     stale: active.filter((run) => isStale(run, now) || run.stalledSeconds !== null).length,
     nonFinite: active.filter((run) => run.nonFinite.length > 0).length,
     failedRecently: status.runs.filter(
@@ -111,6 +128,7 @@ export function stateText(run: WandbRun, now: number): string {
   if (isStale(run, now)) return `no heartbeat for ${duration((now - Date.parse(run.heartbeatAt!)) / 1000)}`;
   if (run.state === "running") return `running ${duration((now - Date.parse(run.createdAt)) / 1000)}`;
   if (run.state === "pending") return "pending";
+  if (run.updating) return `updating, last ${run.heartbeatAt ? `${duration((now - Date.parse(run.heartbeatAt)) / 1000)} ago` : "recently"}`;
   const ended = run.heartbeatAt ? ` ${duration((now - Date.parse(run.heartbeatAt)) / 1000)} ago` : "";
   const took = run.runtime != null ? `, ran ${duration(run.runtime)}` : "";
   return `${run.state}${ended}${took}`;
@@ -165,11 +183,20 @@ export interface Change {
 export function diffRuns(previous: WandbRun[], next: WandbRun[]): Change[] {
   const before = new Map(previous.map((run) => [run.key, run]));
   const changes: Change[] = [];
+  const started = next.filter((run) => !before.has(run.key) && isLive(run));
+  // A relay or sweep adds runs in bursts; one toast per project says enough.
+  if (started.length > 3) {
+    const projects = [...new Set(started.map((run) => run.project))];
+    changes.push({ message: `W&B: ${started.length} new runs in ${projects.join(", ")}`, variant: "info" });
+  } else {
+    for (const run of started) changes.push({ message: `W&B: ${run.name} started (${run.project})`, variant: "info" });
+  }
   for (const run of next) {
     const old = before.get(run.key);
-    if (!old) {
-      if (isActive(run)) changes.push({ message: `W&B: ${run.name} started (${run.project})`, variant: "info" });
-    } else if (old.state !== run.state && run.state !== "unknown") {
+    if (!old) continue;
+    // Scripts that reopen runs flip them between running and finished on every update.
+    if (run.updating && (run.state === "finished" || old.state === "finished")) continue;
+    if (old.state !== run.state && run.state !== "unknown") {
       changes.push({
         message: `W&B: ${run.name} ${run.state}`,
         variant: ENDED_BADLY.has(run.state) ? "warning" : run.state === "finished" ? "success" : "default",

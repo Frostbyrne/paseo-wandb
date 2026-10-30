@@ -3,8 +3,9 @@ import { ExternalLink, Loading, ScrollView, SidebarRow, useToast } from "@getpas
 import { useEffect, useRef } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { WandbRun } from "../shared/wandb";
-import { openRunInWorkspace, REPORTS_ID, SCREEN_ID } from "./navigation";
-import { RunList, StatusSummary } from "./runs";
+import { MAX_SELECTED } from "./model";
+import { openRunInWorkspace, openRunsInWorkspace, REPORTS_ID, SCREEN_ID } from "./navigation";
+import { LoggerList, RunList, StatusSummary } from "./runs";
 import { diffRuns, summarize, useNow, useWandbStatus } from "./state";
 
 /** Toasts when runs start, finish, or crash, so agent training does not go unnoticed. */
@@ -29,6 +30,13 @@ export function WandbPopover({ theme, layout, openScreen, close }: PluginPopover
     close();
     if (!openRunInWorkspace(run)) openScreen({ screenId: SCREEN_ID, params: { run: run.key } });
   };
+  // Several runs open in their workspace's tab when they share one, else in the runs screen.
+  const openKeys = (workspaceId: string | null, keys: string[]) => {
+    close();
+    const picked = keys.slice(0, MAX_SELECTED);
+    if (workspaceId && openRunsInWorkspace(workspaceId, picked)) return;
+    if (picked.length) openScreen({ screenId: SCREEN_ID, params: { runs: picked.join(",") } });
+  };
   return (
     <View style={{ padding: 12, gap: 12, minWidth: layout.compact ? undefined : 360, backgroundColor: theme.colors.surface0 }}>
       <Text style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "600" }}>Weights & Biases</Text>
@@ -39,8 +47,11 @@ export function WandbPopover({ theme, layout, openScreen, close }: PluginPopover
       ) : (
         <>
           <StatusSummary theme={theme} status={data} now={now} />
-          <ScrollView style={{ maxHeight: 420 }}>
-            <RunList theme={theme} runs={data.runs} now={now} onOpen={open} />
+          <ScrollView style={{ maxHeight: 460 }}>
+            <View style={{ gap: 12 }}>
+              <LoggerList theme={theme} loggers={data.loggers} now={now} onOpen={openKeys} />
+              <RunList theme={theme} runs={data.runs} now={now} onOpen={open} onOpenGroup={(runs) => openKeys(runs[0]?.link?.workspaceId ?? null, runs.map((run) => run.key))} />
+            </View>
           </ScrollView>
         </>
       )}
@@ -82,8 +93,10 @@ export function WandbSidebarItem({ theme, currentScreen, openPopover }: PluginSi
   let dot: string | null = null;
   if (data) {
     const summary = summarize(data, now);
-    if (summary.active > 0) {
-      label = `W&B: ${summary.active} running`;
+    const live = [summary.active ? `${summary.active} running` : null, summary.updating ? `${summary.updating} updating` : null].filter(Boolean);
+    if (live.length === 0 && summary.waiting) live.push(`${summary.waiting} waiting`);
+    if (live.length) {
+      label = `W&B: ${live.join(", ")}`;
       dot = summary.nonFinite > 0 ? theme.colors.statusDanger : summary.stale > 0 ? theme.colors.statusWarning : theme.colors.statusSuccess;
     } else {
       label = "W&B: idle";

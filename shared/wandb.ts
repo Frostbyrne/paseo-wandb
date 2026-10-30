@@ -13,6 +13,8 @@ export const linkSourceSchema = z.enum(["process", "transcript"]);
 export const runLinkSchema = z.object({
   workspaceId: z.string().nullable(),
   terminalId: z.string().nullable(),
+  /** The Paseo agent whose process started the run, for agents rather than terminals. */
+  agentId: z.string().nullable(),
   /** The Claude Code session name, such as `project-42`, when known. */
   agentName: z.string().nullable(),
   source: linkSourceSchema,
@@ -64,10 +66,35 @@ export const wandbRunSchema = z.object({
   nonFinite: z.array(z.string()),
   /** Seconds since the last logged step, when a heartbeating run has gone quiet for unusually long. */
   stalledSeconds: z.number().nullable(),
+  /**
+   * Finished in W&B but still being added to: created or reopened by a local script that is still
+   * running, or resumed in short sessions recently, as relays that log a remote job's results do.
+   */
+  updating: z.boolean(),
   /** Flattened config and scalar summary values; only on run queries, not the status poll. */
   config: z.record(z.string(), scalarSchema).optional(),
   summary: z.record(z.string(), scalarSchema).optional(),
 });
+
+/** A W&B-logging script running in one of this host's Paseo terminals. */
+export const loggerSchema = z.object({
+  pid: z.number(),
+  /** The script and its first arguments, such as `train.py sweep-a`. */
+  command: z.string(),
+  /** Processes running it, such as one per GPU under torchrun. */
+  processCount: z.number(),
+  workspaceId: z.string().nullable(),
+  workspaceLabel: z.string().nullable(),
+  agentName: z.string().nullable(),
+  /** ISO times. */
+  startedAt: z.string(),
+  lastLogAt: z.string().nullable(),
+  /** Keys of the listed runs it created or reopened since it started. */
+  runKeys: z.array(z.string()),
+  /** Runs it logged since it started, including ones not listed. */
+  runCount: z.number(),
+});
+export type Logger = z.infer<typeof loggerSchema>;
 
 export const wandbStatusSchema = z.object({
   /** ISO time of the last successful fetch; null until one succeeds. */
@@ -75,8 +102,9 @@ export const wandbStatusSchema = z.object({
   /** The W&B username the key belongs to. */
   user: z.string().nullable(),
   appUrl: z.string(),
-  /** The last successful fetch's runs, active first; still shown when `error` is set. */
+  /** The last successful fetch's runs, live first; still shown when `error` is set. */
   runs: z.array(wandbRunSchema),
+  loggers: z.array(loggerSchema),
   error: z.string().nullable(),
 });
 
@@ -295,3 +323,6 @@ export function parseRunKey(key: string): { entity: string; project: string; id:
 
 /** Runs that are logging or about to. */
 export const isActive = (run: WandbRun) => run.state === "running" || run.state === "pending";
+
+/** Runs that are logging, or finished but still being added to. */
+export const isLive = (run: WandbRun) => isActive(run) || run.updating;

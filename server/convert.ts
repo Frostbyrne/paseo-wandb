@@ -180,6 +180,21 @@ function stalledFor(summary: Record<string, unknown>, raw: RawRun, active: boole
   return quiet > threshold ? Math.round(quiet) : null;
 }
 
+/** How recently a finished run must have been updated to count as still being added to. */
+export const UPDATING_MS = 15 * 60_000;
+
+/**
+ * A finished run resumed in separate sessions: its wall-clock span from creation to the last
+ * heartbeat is well beyond its accumulated runtime, and the last heartbeat is recent.
+ */
+function resumedRecently(summary: Record<string, unknown>, raw: RawRun, active: boolean): boolean {
+  const runtime = numberOrNull(summary._runtime) ?? numberOrNull(summary["_wandb.runtime"]);
+  const started = parseTime(raw.createdAt);
+  const heartbeat = parseTime(raw.heartbeatAt);
+  if (active || runtime === null || !Number.isFinite(started) || !Number.isFinite(heartbeat)) return false;
+  return Date.now() - heartbeat < UPDATING_MS && (heartbeat - started) / 1000 - runtime > 300;
+}
+
 export function toRun(entity: string, project: string, raw: RawRun, app: string, details: boolean): WandbRun {
   const summary = parseObject(raw.summaryMetrics);
   const state = (raw.state ?? "unknown") as RunState;
@@ -213,6 +228,7 @@ export function toRun(entity: string, project: string, raw: RawRun, app: string,
     gpu: active ? gpuOf(parseObject(raw.systemMetrics)) : null,
     nonFinite: Object.keys(summary).filter((key) => isChartKey(key) && nonFiniteText(summary[key]) !== null),
     stalledSeconds: stalledFor(summary, raw, active),
+    updating: resumedRecently(summary, raw, active),
     ...(details ? { config: flattenConfig(parseObject(raw.config)), summary: scalarSummary(summary) } : {}),
   };
 }

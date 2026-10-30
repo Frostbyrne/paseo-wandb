@@ -4,7 +4,7 @@ import { Loading, Modal, ScrollView, useToast } from "@getpaseo/plugin/client/ui
 import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { z } from "zod";
-import { isActive, parseRunKey, type WandbRun } from "../shared/wandb";
+import { isLive, parseRunKey, type WandbRun } from "../shared/wandb";
 import { type BrowserState, DEFAULT_BROWSER, RunsBrowser } from "./browser";
 import { Chip, Segmented } from "./controls";
 import { Explorer } from "./explorer";
@@ -24,7 +24,7 @@ import {
 import { onRequest, takeRequest } from "./navigation";
 import { ReportsList, ReportView } from "./report";
 import { OriginText, useStyles } from "./runs";
-import { stateColor, stateText, useNow, useRunsByKey, useWandbStatus } from "./state";
+import { stateColor, stateText, useNow, useRunsByKey, useStatusLiveness, useWandbStatus } from "./state";
 
 /** Rows for `keys`: fetched ones when present, else rows already seen in a list. */
 function rowsFor(keys: string[], fetched: WandbRun[] | undefined, seen: Map<string, WandbRun>): WandbRun[] {
@@ -42,10 +42,11 @@ export function RunsScreen({ theme, layout, params }: PluginScreenProps) {
   const [pane, setPane] = useState<"runs" | "compare">(params.run ? "compare" : "runs");
   const seen = useRef(new Map<string, WandbRun>()).current;
   const keys = selection.map((entry) => entry.key);
-  const fetched = useRunsByKey(keys, [...seen.values()].some((run) => keys.includes(run.key) && isActive(run)));
-  const rows = rowsFor(keys, fetched.data?.runs, seen);
+  const fetched = useRunsByKey(keys, [...seen.values()].some((run) => keys.includes(run.key) && isLive(run)));
+  const rows = useStatusLiveness(rowsFor(keys, fetched.data?.runs, seen));
 
-  // Opening the screen for one run shows that run's project and adds the run to the comparison.
+  // Opening the screen for one run shows that run's project and adds the run to the comparison;
+  // opening it for several (`runs`, comma-separated) compares just those.
   useEffect(() => {
     const parsed = params.run ? parseRunKey(params.run) : null;
     if (!parsed || !params.run) return;
@@ -53,6 +54,14 @@ export function RunsScreen({ theme, layout, params }: PluginScreenProps) {
     if (!selection.some((entry) => entry.key === params.run)) setSelection(toggleSelection(selection.length >= MAX_SELECTED ? selection.slice(1) : selection, params.run));
     setPane("compare");
   }, [params.run]);
+  useEffect(() => {
+    const keys = (params.runs ?? "").split(",").filter((key) => parseRunKey(key));
+    if (!keys.length) return;
+    const parsed = parseRunKey(keys[0])!;
+    setBrowser({ ...browser, project: `${parsed.entity}/${parsed.project}` });
+    setSelection(selectionOf(keys));
+    setPane("compare");
+  }, [params.runs]);
 
   const toggle = (run: WandbRun) => {
     seen.set(run.key, run);
@@ -101,6 +110,8 @@ export function RunsScreen({ theme, layout, params }: PluginScreenProps) {
   );
 }
 
+const MAX_CHIPS = 12;
+
 const panelStateSchema = z.object({
   /** Null until the user changes it; until then every run from this workspace is compared. */
   selection: selectionSchema.nullable(),
@@ -141,6 +152,7 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
   const { data, isPending } = useWandbStatus();
   const now = useNow(15_000);
   const [state, setState] = useTabState(tab, panelStateSchema, { selection: null, extras: [], prefs: DEFAULT_PREFS });
+  const [allChips, setAllChips] = useState(false);
   const seen = useRef(new Map<string, WandbRun>()).current;
   // Newest first by creation, so chips keep their places as heartbeats arrive.
   const linked = (data?.runs ?? [])
@@ -149,20 +161,25 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
   for (const run of linked) if (!seen.has(run.key)) seen.set(run.key, run);
   const candidates = [...new Set([...linked.map((run) => run.key), ...state.extras])];
   const selection = state.selection ?? selectionOf(linked.map((run) => run.key));
-  const fetched = useRunsByKey(candidates, linked.some(isActive));
-  const rows = rowsFor(candidates, fetched.data?.runs, seen);
+  const fetched = useRunsByKey(candidates, linked.some(isLive));
+  const rows = useStatusLiveness(rowsFor(candidates, fetched.data?.runs, seen));
   const stateRef = useRef(state);
   stateRef.current = state;
+  const linkedRef = useRef<string[]>([]);
+  linkedRef.current = linked.map((run) => run.key);
   const setRef = useRef(setState);
   setRef.current = setState;
 
   // "Charts" on a run elsewhere asks this tab to show that run.
   useEffect(() => {
     const apply = () => {
-      const key = takeRequest(workspaceId);
-      if (!key) return;
+      const keys = takeRequest(workspaceId);
+      if (!keys?.length) return;
       const current = stateRef.current;
-      setRef.current({ ...current, selection: [{ key, slot: 0 }], extras: current.extras });
+      // Runs this workspace did not start are added as extras so their chips appear.
+      const linkedKeys = new Set(linkedRef.current);
+      const extras = [...new Set([...current.extras, ...keys.filter((key) => !linkedKeys.has(key))])];
+      setRef.current({ ...current, selection: selectionOf(keys), extras });
     };
     apply();
     return onRequest((requested) => {
@@ -186,6 +203,13 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
 
   if (isPending || !data) return <Loading />;
   const slots = new Map(selection.map((entry) => [entry.key, entry.slot]));
+  // Scripts and sweeps leave dozens of runs; past a dozen, chips show the picked, live, and added ones.
+  const keep = (key: string) => {
+    const run = rows.find((candidate) => candidate.key === key) ?? linked.find((candidate) => candidate.key === key);
+    return slots.has(key) || state.extras.includes(key) || (run !== undefined && isLive(run));
+  };
+  const shownChips = allChips || candidates.length <= MAX_CHIPS ? candidates : candidates.filter(keep);
+  const hiddenChips = candidates.length - shownChips.length;
   const labels = runLabels(rows);
   const nameOf = (key: string) => labels.get(key) ?? parseRunKey(key)?.id ?? key;
   const focus = rows.find((run) => run.key === selection[0]?.key) ?? null;
@@ -193,7 +217,7 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
   return (
     <ScrollView style={{ flex: 1, backgroundColor: theme.colors.surface0 }} contentContainerStyle={{ padding: layout.compact ? 16 : 24, gap: 16 }}>
       <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-        {candidates.map((key) => {
+        {shownChips.map((key) => {
           const slot = slots.get(key);
           const extra = state.extras.includes(key) && !linked.some((run) => run.key === key);
           const run = rows.find((candidate) => candidate.key === key);
@@ -216,6 +240,14 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
             </View>
           );
         })}
+        {hiddenChips > 0 || allChips ? (
+          <Chip
+            theme={theme}
+            label={allChips ? "Show fewer" : `+${hiddenChips} more`}
+            onPress={() => setAllChips(!allChips)}
+            accessibilityLabel={allChips ? "Show only picked and live runs" : `Show ${hiddenChips} more runs from this workspace`}
+          />
+        ) : null}
         <CompareWith theme={theme} workspaceId={workspaceId} selection={selection} onToggle={(run) => toggle(run.key, run)} />
       </View>
       {candidates.length === 0 ? (

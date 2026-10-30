@@ -11,15 +11,14 @@ export function setClient(next: PluginClientContext | null) {
   client = next;
 }
 
-// Workspace panels take no params, so the run to show travels through this module.
-const requests = new Map<string, string>();
+// Workspace panels take no params, so the runs to show travel through this module.
+const requests = new Map<string, string[]>();
 const listeners = new Set<(workspaceId: string) => void>();
 
-/** Opens the run's charts in a tab of the workspace that started it; false when there is none. */
-export function openRunInWorkspace(run: WandbRun): boolean {
-  const workspaceId = run.link?.workspaceId;
-  if (!client || !workspaceId) return false;
-  requests.set(workspaceId, run.key);
+/** Opens a workspace's W&B tab showing `keys`; false when the workspace cannot be opened here. */
+export function openRunsInWorkspace(workspaceId: string, keys: string[]): boolean {
+  if (!client) return false;
+  requests.set(workspaceId, keys);
   try {
     client.openPanel(PANEL_ID, { workspaceId });
   } catch (error) {
@@ -32,11 +31,16 @@ export function openRunInWorkspace(run: WandbRun): boolean {
   return true;
 }
 
-/** The run a caller asked a workspace's tab to show, once. */
-export function takeRequest(workspaceId: string): string | null {
-  const key = requests.get(workspaceId) ?? null;
+/** Opens the run's charts in a tab of the workspace that started it; false when there is none. */
+export function openRunInWorkspace(run: WandbRun): boolean {
+  return run.link?.workspaceId ? openRunsInWorkspace(run.link.workspaceId, [run.key]) : false;
+}
+
+/** The runs a caller asked a workspace's tab to show, once. */
+export function takeRequest(workspaceId: string): string[] | null {
+  const keys = requests.get(workspaceId) ?? null;
   requests.delete(workspaceId);
-  return key;
+  return keys;
 }
 
 export function onRequest(listener: (workspaceId: string) => void): () => void {

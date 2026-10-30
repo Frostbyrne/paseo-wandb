@@ -27,9 +27,11 @@ const TRANSCRIPT_DEPTH = 5;
 const MENTION_BEFORE_MS = 10 * 60_000;
 const MENTION_AFTER_MS = 30 * 60_000;
 
+/** Paseo terminals export the workspace and terminal; Paseo agents export the agent. */
 interface PaseoEnv {
   workspaceId: string | null;
   terminalId: string | null;
+  agentId: string | null;
 }
 
 async function readPaseoEnv(pid: string): Promise<PaseoEnv | null> {
@@ -41,43 +43,195 @@ async function readPaseoEnv(pid: string): Promise<PaseoEnv | null> {
   }
   let workspaceId: string | null = null;
   let terminalId: string | null = null;
+  let agentId: string | null = null;
   for (const entry of environ.split("\0")) {
     if (entry.startsWith("PASEO_WORKSPACE_ID=")) workspaceId = entry.slice(19) || null;
     else if (entry.startsWith("PASEO_TERMINAL_ID=")) terminalId = entry.slice(18) || null;
+    else if (entry.startsWith("PASEO_AGENT_ID=")) agentId = entry.slice(15) || null;
   }
-  return workspaceId || terminalId ? { workspaceId, terminalId } : null;
+  return workspaceId || terminalId || agentId ? { workspaceId, terminalId, agentId } : null;
 }
 
-/** Run ID to the Paseo terminal of each live local run process. Empty off Linux. */
-async function scanProcesses(): Promise<Map<string, PaseoEnv>> {
-  const found = new Map<string, PaseoEnv>();
+/** A W&B-logging script running in a Paseo terminal, whether or not it has a run open right now. */
+export interface LocalLogger {
+  pid: number;
+  processCount: number;
+  /** The script and its first arguments, such as `train.py sweep-a`. */
+  command: string;
+  env: PaseoEnv;
+  /** Epoch ms. */
+  startedAt: number;
+  /** Runs this process created or resumed since it started, from its wandb directory. */
+  runIds: string[];
+  /** Epoch ms of its newest run directory, or null before its first log. */
+  lastLogAt: number | null;
+}
+
+/** Direct use of wandb, or the framework integrations that log to it. */
+const USES_WANDB = /^\s*(?:import\s+wandb\b|from\s+wandb\b)|\bWandbLogger\b|\bWandbCallback\b|report_to\s*=\s*\[?\s*["']wandb["']/m;
+const RUN_DIR_NAME = /^(?:offline-)?run-\d{8}_\d{6}-(.+)$/;
+/** Linux reports process start times in clock ticks; USER_HZ is 100 on every common build. */
+const CLOCK_TICKS = 100;
+
+let bootTime: number | null = null;
+
+async function processStart(pid: string): Promise<number | null> {
+  try {
+    bootTime ??= Number((await readFile("/proc/stat", "utf8")).match(/^btime (\d+)/m)?.[1]) * 1000;
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    // Field 22 of /proc/<pid>/stat; the slice starts at field 3.
+    return bootTime + (Number(fields[19]) / CLOCK_TICKS) * 1000;
+  } catch {
+    return null;
+  }
+}
+
+async function readEnviron(pid: string): Promise<Map<string, string>> {
+  const environ = await readFile(`/proc/${pid}/environ`, "utf8").catch(() => "");
+  return new Map(
+    environ
+      .split("\0")
+      .filter((entry) => entry.includes("="))
+      .map((entry) => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)] as const),
+  );
+}
+
+/**
+ * The script a Python process runs, if any, and whether its source uses wandb. Launchers such as
+ * torchrun or accelerate pass the script as a later argument; `python -m pkg.module` names a
+ * module, whose source is not read, so only a wandb-core child marks it.
+ */
+async function scriptOf(pid: string, cwd: string): Promise<{ command: string; usesWandb: boolean } | null> {
+  const argv = (await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "")).split("\0").filter(Boolean);
+  const module = argv.indexOf("-m");
+  const index = argv.findIndex((arg, position) => position > 0 && !arg.startsWith("-") && arg.endsWith(".py"));
+  const start = index >= 0 ? index : module >= 0 && argv[module + 1] ? module + 1 : -1;
+  if (start < 0) return null;
+  // Positional words make the label; flags and their values, paths, globs, addresses, and numbers do not.
+  const words: string[] = [];
+  for (let position = start + 1; position < argv.length; position++) {
+    const arg = argv[position];
+    if (arg.startsWith("-")) {
+      if (!arg.includes("=") && argv[position + 1] && !argv[position + 1].startsWith("-")) position++;
+      continue;
+    }
+    if (!/[/*=]/.test(arg) && !/^[\d.:e+-]+$/i.test(arg)) words.push(arg);
+  }
+  const name = index >= 0 ? basename(argv[index]) : `-m ${argv[start]}`;
+  const command = [name, ...words.slice(0, 2)].join(" ");
+  if (index < 0) return { command, usesWandb: false };
+  const source = await readFile(argv[index].startsWith("/") ? argv[index] : join(cwd, argv[index]), "utf8").catch(() => "");
+  return { command, usesWandb: USES_WANDB.test(source.slice(0, 256 * 1024)) };
+}
+
+/** The process that wrote a run directory, from the `MainThread:<pid>` prefix of its wandb debug log. */
+async function writerPid(runDir: string): Promise<string | null> {
+  const handle = await open(join(runDir, "logs", "debug.log"), "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    const buffer = Buffer.alloc(1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.toString("utf8", 0, bytesRead).match(/MainThread:(\d+)/)?.[1] ?? null;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Run directories in `dir` that process `pid` touched since `since`, newest last. Several scripts can share a directory. */
+async function recentRunDirs(dir: string, since: number, pid: string): Promise<{ id: string; at: number }[]> {
+  const entries = await readdir(dir).catch(() => [] as string[]);
+  const found = await Promise.all(
+    entries.map(async (name) => {
+      const match = name.match(RUN_DIR_NAME);
+      if (!match) return null;
+      const info = await stat(join(dir, name)).catch(() => null);
+      if (!info || info.mtimeMs < since) return null;
+      const writer = await writerPid(join(dir, name));
+      return writer === null || writer === pid ? { id: match[1], at: info.mtimeMs } : null;
+    }),
+  );
+  return found.filter((entry): entry is { id: string; at: number } => entry !== null).sort((a, b) => a.at - b.at);
+}
+
+/**
+ * Local W&B activity: the run directories live processes hold open, mapped to their Paseo terminal,
+ * and the W&B-logging scripts in Paseo terminals. Empty off Linux.
+ */
+async function scanProcesses(): Promise<{ runs: Map<string, PaseoEnv>; loggers: LocalLogger[] }> {
+  const runs = new Map<string, PaseoEnv>();
+  const loggers: LocalLogger[] = [];
   let pids: string[];
   try {
     pids = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
   } catch {
-    return found;
+    return { runs, loggers };
   }
+  const comms = new Map<string, string>();
+  const parents = new Map<string, string>();
   await Promise.all(
     pids.map(async (pid) => {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+      if (!stat) return;
+      comms.set(pid, stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")")));
+      parents.set(pid, stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+    }),
+  );
+  // wandb starts a wandb-core service on its first run and keeps it for the process's lifetime.
+  const hasWandbCore = new Set([...comms].filter(([, comm]) => comm.startsWith("wandb-core")).map(([pid]) => parents.get(pid)));
+  await Promise.all(
+    [...comms].map(async ([pid, comm]) => {
+      if (!/^(wandb|python)/i.test(comm)) return;
       try {
         // The training process and wandb-core both hold the run directory open.
-        const comm = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
-        if (!/^(wandb|python)/i.test(comm)) return;
         const ids = new Set<string>();
         for (const fd of await readdir(`/proc/${pid}/fd`)) {
           const target = await readlink(`/proc/${pid}/fd/${fd}`).catch(() => "");
           for (const match of target.matchAll(RUN_DIR)) ids.add(match[1]);
         }
-        if (ids.size === 0) return;
         const env = await readPaseoEnv(pid);
         if (!env) return;
-        for (const id of ids) found.set(id, env);
+        for (const id of ids) runs.set(id, env);
+        if (!/^(python|pypy)/i.test(comm)) return;
+        const cwd = await readlink(`/proc/${pid}/cwd`).catch(() => "");
+        const script = await scriptOf(pid, cwd);
+        if (!script || !(script.usesWandb || hasWandbCore.has(pid))) return;
+        const startedAt = (await processStart(pid)) ?? Date.now();
+        const environ = await readEnviron(pid);
+        const dirs = await recentRunDirs(join(environ.get("WANDB_DIR") || cwd, "wandb"), startedAt - 5_000, pid);
+        loggers.push({
+          pid: Number(pid),
+          processCount: 1,
+          command: script.command,
+          env,
+          startedAt,
+          runIds: [...new Set([...dirs.map((dir) => dir.id), ...ids])],
+          lastLogAt: dirs.length ? dirs[dirs.length - 1].at : null,
+          cwd,
+        } as LocalLogger & { cwd: string });
       } catch {
         // The process exited or is not ours.
       }
     }),
   );
-  return found;
+  return { runs, loggers: mergeLoggers(loggers as (LocalLogger & { cwd: string })[]) };
+}
+
+/** One entry per script: multi-process launches, such as torchrun's one process per GPU, run it many times. */
+function mergeLoggers(loggers: (LocalLogger & { cwd: string })[]): LocalLogger[] {
+  const merged = new Map<string, LocalLogger>();
+  for (const { cwd, ...logger } of loggers.sort((a, b) => a.startedAt - b.startedAt || a.pid - b.pid)) {
+    const key = JSON.stringify([logger.command, cwd, logger.env]);
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, logger);
+      continue;
+    }
+    existing.processCount++;
+    existing.runIds = [...new Set([...existing.runIds, ...logger.runIds])];
+    existing.lastLogAt = Math.max(existing.lastLogAt ?? 0, logger.lastLogAt ?? 0) || null;
+  }
+  return [...merged.values()];
 }
 
 interface ClaudeSession {
@@ -263,9 +417,12 @@ export class RunLinker {
    * explains start a background transcript search, at most once a minute, whose links appear on
    * a later call.
    */
-  async resolve(runs: LinkRequest[]): Promise<Map<string, RunLink>> {
+  async resolve(runs: LinkRequest[]): Promise<{ links: Map<string, RunLink>; loggers: (LocalLogger & { agentName: string | null })[] }> {
     const stored = await this.load();
-    const [processes, sessions] = await Promise.all([scanProcesses(), readClaudeSessions()]);
+    const [scan, sessions] = await Promise.all([scanProcesses(), readClaudeSessions()]);
+    // A script's runs count as its process's even between logs, when no file is open.
+    const processes = new Map(scan.runs);
+    for (const logger of scan.loggers) for (const id of logger.runIds) if (!processes.has(id)) processes.set(id, logger.env);
     const byTerminal = new Map(sessions.filter((session) => session.env.terminalId).map((session) => [session.env.terminalId!, session]));
     const result = new Map<string, RunLink>();
     const unexplained: LinkRequest[] = [];
@@ -277,6 +434,7 @@ export class RunLinker {
         const link: RunLink = {
           workspaceId: env.workspaceId,
           terminalId: env.terminalId,
+          agentId: env.agentId,
           // Keep a name learned earlier if the session has since closed.
           agentName: session?.name ?? stored.get(run.key)?.link.agentName ?? null,
           source: "process",
@@ -300,7 +458,11 @@ export class RunLinker {
           this.transcriptScan = null;
         });
     }
-    return result;
+    const loggers = scan.loggers.map((logger) => ({
+      ...logger,
+      agentName: (logger.env.terminalId ? byTerminal.get(logger.env.terminalId)?.name : undefined) ?? null,
+    }));
+    return { links: result, loggers };
   }
 
   /** Saved links only, for runs that come from queries rather than the status poll. */
@@ -327,6 +489,7 @@ export class RunLinker {
         remember(stored, run.key, {
           workspaceId: session?.env.workspaceId ?? null,
           terminalId: session?.env.terminalId ?? null,
+          agentId: session?.env.agentId ?? null,
           agentName: session?.name ?? null,
           source: "transcript",
         }) || changed;
@@ -341,7 +504,8 @@ export class RunLinker {
       const data = JSON.parse(await readFile(LINKS_FILE, "utf8")) as { links?: Record<string, StoredLink> };
       const cutoff = Date.now() - LINK_TTL_MS;
       for (const [key, value] of Object.entries(data.links ?? {})) {
-        if (value?.link && value.linkedAt > cutoff) stored.set(key, value);
+        // Links saved before agent IDs were recorded lack the field.
+        if (value?.link && value.linkedAt > cutoff) stored.set(key, { ...value, link: { ...value.link, agentId: value.link.agentId ?? null } });
       }
     } catch {
       // First run, or an unreadable file that the next save replaces.

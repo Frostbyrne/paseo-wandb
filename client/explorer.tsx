@@ -3,7 +3,7 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { useQueries } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { isActive, type RunHistory, runHistoryRpc, type Series, type WandbRun } from "../shared/wandb";
+import { isActive, isLive, type RunHistory, runHistoryRpc, type Series, type WandbRun } from "../shared/wandb";
 import { ChartCard, type ChartLine, ChartGrid } from "./chart";
 import { CompareTable } from "./compare";
 import { Chip, Field, LineKey, Segmented, Slider, Toggle } from "./controls";
@@ -47,8 +47,8 @@ function useHistories(runs: WandbRun[]) {
     queries: runs.map((run) => ({
       queryKey: ["wandb-history", run.key],
       queryFn: () => fetchHistory({ entity: run.entity, project: run.project, id: run.id }),
-      refetchInterval: isActive(run) ? POLL_MS : (false as const),
-      staleTime: isActive(run) ? 0 : Infinity,
+      refetchInterval: isLive(run) ? POLL_MS : (false as const),
+      staleTime: isLive(run) ? 0 : Infinity,
       retry: 1,
     })),
   });
@@ -276,7 +276,7 @@ function LiveStrip({
   onLogs: (key: string) => void;
 }) {
   const now = useNow(15_000);
-  const live = runs.filter(isActive);
+  const live = runs.filter(isLive);
   if (live.length === 0) return null;
   const link = { color: theme.colors.accent, fontSize: 12, fontWeight: "600" as const };
   return (

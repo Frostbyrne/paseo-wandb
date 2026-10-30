@@ -4,7 +4,7 @@ import { ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { type NativeScrollEvent, type NativeSyntheticEvent, Pressable, ScrollView as NativeScrollView, Text, View } from "react-native";
-import { isActive, type LogLine, runLogsRpc, stopRunRpc, type WandbRun } from "../shared/wandb";
+import { isActive, isLive, type LogLine, runLogsRpc, stopRunRpc, type WandbRun } from "../shared/wandb";
 import { Toggle } from "./controls";
 import { duration, formatValue } from "./state";
 
@@ -183,7 +183,7 @@ export function LogsView({ theme, run }: { theme: PluginTheme; run: WandbRun }) 
   const logs = useQuery({
     queryKey: ["wandb-logs", run.key],
     queryFn: () => fetchLogs({ entity: run.entity, project: run.project, id: run.id }),
-    refetchInterval: isActive(run) ? LOG_POLL_MS : false,
+    refetchInterval: isLive(run) ? LOG_POLL_MS : false,
     retry: 1,
   });
   const [follow, setFollow] = useState(true);
