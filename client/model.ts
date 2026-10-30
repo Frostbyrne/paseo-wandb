@@ -6,8 +6,17 @@ import { z } from "zod";
 const LIGHT_SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"];
 const DARK_SERIES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
 
-/** Runs compared at once; more cannot be told apart by color. */
-export const MAX_SELECTED = LIGHT_SERIES.length;
+const PALETTE_SIZE = LIGHT_SERIES.length;
+
+/** Line styles that tell apart runs sharing a color: the palette repeats solid, then dashed, then dotted. */
+export type Dash = "solid" | "dashed" | "dotted";
+const DASHES: Dash[] = ["solid", "dashed", "dotted"];
+
+/** Runs compared at once: every color in every line style, so each run's line stays distinct. */
+export const MAX_SELECTED = PALETTE_SIZE * DASHES.length;
+
+/** Runs picked automatically, such as all of a workspace's runs: one per color, all solid. */
+export const AUTO_SELECTED = PALETTE_SIZE;
 
 function luminance(color: string): number | null {
   let rgb: number[] | null = null;
@@ -30,7 +39,9 @@ function luminance(color: string): number | null {
 /** The theme has no light or dark flag, so the background decides. */
 export const isDark = (theme: PluginTheme) => (luminance(theme.colors.surface0) ?? 1) < 0.3;
 
-export const seriesColor = (theme: PluginTheme, slot: number) => (isDark(theme) ? DARK_SERIES : LIGHT_SERIES)[slot % MAX_SELECTED];
+export const seriesColor = (theme: PluginTheme, slot: number) => (isDark(theme) ? DARK_SERIES : LIGHT_SERIES)[slot % PALETTE_SIZE];
+
+export const seriesDash = (slot: number): Dash => DASHES[Math.floor(slot / PALETTE_SIZE) % DASHES.length];
 
 /** A run picked for comparison and the color slot it keeps while picked. */
 export const selectionSchema = z.array(z.object({ key: z.string(), slot: z.number().int().min(0).max(MAX_SELECTED - 1) }));
@@ -53,15 +64,15 @@ export function runLabels(runs: { key: string; name: string; id: string }[]): Ma
   return new Map(runs.map((run) => [run.key, (counts.get(run.name) ?? 0) > 1 ? `${run.name} · ${run.id}` : run.name]));
 }
 
-export function selectionOf(keys: string[]): Selection {
-  return keys.slice(0, MAX_SELECTED).map((key, slot) => ({ key, slot }));
+export function selectionOf(keys: string[], limit = MAX_SELECTED): Selection {
+  return keys.slice(0, Math.min(limit, MAX_SELECTED)).map((key, slot) => ({ key, slot }));
 }
 
 export const xAxisSchema = z.enum(["step", "runtime", "wall"]);
 export type XAxis = z.infer<typeof xAxisSchema>;
 
 export const prefsSchema = z.object({
-  view: z.enum(["charts", "logs", "table"]),
+  view: z.enum(["charts", "media", "logs", "table"]),
   /** Exponential moving average weight, 0 to 0.99. */
   smoothing: z.number().min(0).max(0.99),
   xAxis: xAxisSchema,
@@ -94,15 +105,19 @@ export const DEFAULT_PREFS: ChartPrefs = {
 // Screens remount when you navigate away and back; this keeps their state for the session.
 const memory = new Map<string, unknown>();
 
-export function useRemembered<T>(key: string, initial: T | (() => T)): [T, (next: T) => void] {
+/** Takes a value or, for changes made in quick succession, a function of the latest value. */
+export function useRemembered<T>(key: string, initial: T | (() => T)): [T, (next: T | ((previous: T) => T)) => void] {
   const [value, setValue] = useState<T>(() =>
     memory.has(key) ? (memory.get(key) as T) : typeof initial === "function" ? (initial as () => T)() : initial,
   );
   return [
     value,
-    (next: T) => {
-      memory.set(key, next);
-      setValue(next);
+    (next) => {
+      setValue((previous) => {
+        const resolved = typeof next === "function" ? (next as (previous: T) => T)(previous) : next;
+        memory.set(key, resolved);
+        return resolved;
+      });
     },
   ];
 }

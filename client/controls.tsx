@@ -2,6 +2,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { TextInput } from "@getpaseo/plugin/client/ui";
 import { useEffect, useRef, useState } from "react";
 import { type GestureResponderEvent, type LayoutChangeEvent, Pressable, Text, View } from "react-native";
+import type { Dash } from "./model";
 
 export function Segmented<Value extends string>({
   theme,
@@ -134,9 +135,17 @@ export function Toggle({ theme, label, value, onChange }: { theme: PluginTheme; 
   );
 }
 
-/** A run's color as a short line, the way the legend and tooltip key lines. */
-export function LineKey({ color, width = 12 }: { color: string; width?: number }) {
-  return <View style={{ width, height: 3, borderRadius: 1.5, backgroundColor: color }} />;
+/** A run's color and line style as a short line, the way the legend and tooltip key lines. */
+export function LineKey({ color, width = 12, dash = "solid" }: { color: string; width?: number; dash?: Dash }) {
+  if (dash === "solid") return <View style={{ width, height: 3, borderRadius: 1.5, backgroundColor: color }} />;
+  const [on, off] = dash === "dashed" ? [4, 2] : [2, 2];
+  return (
+    <View style={{ width, height: 3, flexDirection: "row", gap: off, overflow: "hidden" }}>
+      {Array.from({ length: Math.ceil(width / (on + off)) }, (_, index) => (
+        <View key={index} style={{ width: on, height: 3, borderRadius: 1.5, backgroundColor: color }} />
+      ))}
+    </View>
+  );
 }
 
 export function Chip({
@@ -144,6 +153,7 @@ export function Chip({
   label,
   selected = false,
   color,
+  dash,
   status,
   onPress,
   accessibilityLabel,
@@ -153,6 +163,7 @@ export function Chip({
   selected?: boolean;
   /** The run's chart color, drawn as a line after the label. */
   color?: string | null;
+  dash?: Dash;
   /** The run's state color, drawn as a dot before the label. */
   status?: string | null;
   onPress: () => void;
@@ -180,7 +191,7 @@ export function Chip({
       <Text style={{ color: selected ? theme.colors.foreground : theme.colors.foregroundMuted, fontSize: 12 }} numberOfLines={1}>
         {label}
       </Text>
-      {color ? <LineKey color={color} /> : null}
+      {color ? <LineKey color={color} dash={dash} /> : null}
     </Pressable>
   );
 }

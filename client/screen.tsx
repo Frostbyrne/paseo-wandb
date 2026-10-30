@@ -11,6 +11,7 @@ import { Explorer } from "./explorer";
 import {
   type ChartPrefs,
   DEFAULT_PREFS,
+  AUTO_SELECTED,
   MAX_SELECTED,
   prefsSchema,
   runLabels,
@@ -18,6 +19,7 @@ import {
   selectionOf,
   selectionSchema,
   seriesColor,
+  seriesDash,
   toggleSelection,
   useRemembered,
 } from "./model";
@@ -65,7 +67,7 @@ export function RunsScreen({ theme, layout, params }: PluginScreenProps) {
 
   const toggle = (run: WandbRun) => {
     seen.set(run.key, run);
-    setSelection(toggleSelection(selection, run.key));
+    setSelection((current) => toggleSelection(current, run.key));
   };
   const padding = layout.compact ? 16 : 24;
   const browserView = <RunsBrowser theme={theme} state={browser} onState={setBrowser} selection={selection} onToggle={toggle} />;
@@ -160,7 +162,7 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   for (const run of linked) if (!seen.has(run.key)) seen.set(run.key, run);
   const candidates = [...new Set([...linked.map((run) => run.key), ...state.extras])];
-  const selection = state.selection ?? selectionOf(linked.map((run) => run.key));
+  const selection = state.selection ?? selectionOf(linked.map((run) => run.key), AUTO_SELECTED);
   const fetched = useRunsByKey(candidates, linked.some(isLive));
   const rows = useStatusLiveness(rowsFor(candidates, fetched.data?.runs, seen));
   const stateRef = useRef(state);
@@ -228,6 +230,7 @@ export function RunsPanel({ theme, layout, workspaceId, tab, revision }: PluginW
                 label={nameOf(key)}
                 selected={slot !== undefined}
                 color={slot !== undefined ? seriesColor(theme, slot) : null}
+                dash={slot !== undefined ? seriesDash(slot) : undefined}
                 status={run ? stateColor(run, theme, now) : null}
                 onPress={() => toggle(key)}
                 accessibilityLabel={`${slot !== undefined ? "Hide" : "Show"} ${nameOf(key)}${run ? `, ${stateText(run, now)}` : ""}`}

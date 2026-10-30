@@ -14,7 +14,7 @@ import {
   type WandbRun,
 } from "../shared/wandb";
 import { Chip, Field, LineKey, Segmented } from "./controls";
-import { MAX_SELECTED, runLabels, type Selection, seriesColor } from "./model";
+import { MAX_SELECTED, runLabels, type Selection, seriesColor, seriesDash } from "./model";
 import { duration, formatValue, stateColor, useNow } from "./state";
 
 export interface BrowserState {
@@ -156,7 +156,7 @@ function RunRow({
           justifyContent: "center",
         }}
       >
-        {selected ? <LineKey color={seriesColor(theme, slot)} width={8} /> : null}
+        {selected ? <LineKey color={seriesColor(theme, slot)} dash={seriesDash(slot)} width={10} /> : null}
       </View>
       <View style={{ flex: 1, gap: 2 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>

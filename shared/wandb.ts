@@ -314,6 +314,57 @@ export const reportRpc = defineRpc({
   output: z.object({ report: reportSummarySchema, blocks: z.array(reportBlockSchema) }),
 });
 
+/** One logged value of a media key: the files it points to and what W&B recorded about them. */
+export const mediaEntrySchema = z.object({
+  step: z.number().nullable(),
+  /** Paths within the run's files, such as `media/images/sample_3_ab12.png`. */
+  files: z.array(z.string()),
+  captions: z.array(z.string().nullable()),
+  width: z.number().nullable(),
+  height: z.number().nullable(),
+  rows: z.number().nullable(),
+  cols: z.number().nullable(),
+  /** Inline histogram data: bin edges (one more than values) and counts. */
+  histogram: z.object({ bins: z.array(z.number()), values: z.array(z.number()) }).nullable(),
+});
+export type MediaEntry = z.infer<typeof mediaEntrySchema>;
+
+export const mediaKindSchema = z.enum(["images", "table", "chart", "histogram", "video", "audio", "html", "other"]);
+export type MediaKind = z.infer<typeof mediaKindSchema>;
+
+export const mediaItemSchema = z.object({
+  key: z.string(),
+  kind: mediaKindSchema,
+  /** W&B's media type, or the chart preset for custom charts, such as `wandb/bar/v0`. */
+  type: z.string(),
+  /** Every logged value, oldest first, up to a sample of steps. */
+  entries: z.array(mediaEntrySchema),
+  /** For custom charts (wandb.plot.*): the preset's field mapping onto the chart's table columns. */
+  chart: z.object({ title: z.string().nullable(), fields: z.record(z.string(), z.string()) }).nullable(),
+});
+export type MediaItem = z.infer<typeof mediaItemSchema>;
+
+export const mediaIndexRpc = defineRpc({
+  name: "wandb.media-index",
+  input: z.object({ entity: z.string(), project: z.string(), id: z.string() }),
+  output: z.object({ items: z.array(mediaItemSchema), omitted: z.number() }),
+});
+
+/** A table cell: a plain value, or a reference to an image file of the run. */
+export const tableCellSchema = z.union([z.number(), z.string(), z.boolean(), z.null(), z.object({ image: z.string() })]);
+export type TableCell = z.infer<typeof tableCellSchema>;
+
+export const mediaFileRpc = defineRpc({
+  name: "wandb.media-file",
+  input: z.object({ entity: z.string(), project: z.string(), id: z.string(), path: z.string() }),
+  output: z.discriminatedUnion("kind", [
+    /** A data URI, so storage links and credentials stay on the daemon. */
+    z.object({ kind: z.literal("image"), uri: z.string() }),
+    z.object({ kind: z.literal("table"), columns: z.array(z.string()), rows: z.array(z.array(tableCellSchema)), total: z.number() }),
+    z.object({ kind: z.literal("unavailable"), reason: z.string() }),
+  ]),
+});
+
 export const runKey = (entity: string, project: string, id: string) => `${entity}/${project}/${id}`;
 
 export function parseRunKey(key: string): { entity: string; project: string; id: string } | null {

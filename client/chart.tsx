@@ -1,7 +1,8 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { memo, type ReactNode, useMemo, useState } from "react";
 import { type GestureResponderEvent, type LayoutChangeEvent, Text, View } from "react-native";
-import type { XAxis } from "./model";
+import { LineKey } from "./controls";
+import type { Dash, XAxis } from "./model";
 import { extent, nearest, thin, type XY } from "./series";
 import { formatPair, formatValue } from "./state";
 
@@ -24,6 +25,7 @@ export const Polyline = memo(function Polyline({
   yRange,
   lineWidth = 1.5,
   opacity = 1,
+  dash = "solid",
 }: {
   points: XY[];
   width: number;
@@ -33,6 +35,7 @@ export const Polyline = memo(function Polyline({
   yRange: { min: number; max: number };
   lineWidth?: number;
   opacity?: number;
+  dash?: Dash;
 }) {
   const segments = useMemo(() => {
     if (points.length === 0 || width <= 0) return [];
@@ -43,10 +46,8 @@ export const Polyline = memo(function Polyline({
       const [x, y] = pixels[0];
       return [{ left: x - 2, top: y - 2, width: 4, height: 4, borderRadius: 2, rotate: "0rad" }];
     }
-    return pixels.slice(1).map(([x2, y2], index) => {
-      const [x1, y1] = pixels[index];
-      // Half a line width of overlap closes the gaps at the joints.
-      const length = Math.hypot(x2 - x1, y2 - y1) + lineWidth / 2;
+    const piece = (x1: number, y1: number, x2: number, y2: number, overlap: number) => {
+      const length = Math.hypot(x2 - x1, y2 - y1) + overlap;
       return {
         left: (x1 + x2) / 2 - length / 2,
         top: (y1 + y2) / 2 - lineWidth / 2,
@@ -55,8 +56,34 @@ export const Polyline = memo(function Polyline({
         borderRadius: lineWidth / 2,
         rotate: `${Math.atan2(y2 - y1, x2 - x1)}rad`,
       };
-    });
-  }, [points, width, height, xRange.min, xRange.max, yRange.min, yRange.max, lineWidth]);
+    };
+    if (dash === "solid") {
+      // Half a line width of overlap closes the gaps at the joints.
+      return pixels.slice(1).map(([x2, y2], index) => piece(pixels[index][0], pixels[index][1], x2, y2, lineWidth / 2));
+    }
+    // Dashes follow the line's length across joints, so the pattern stays even on bends.
+    const [on, off] = dash === "dashed" ? [6, 4] : [lineWidth, 3];
+    const pieces: ReturnType<typeof piece>[] = [];
+    let phase = 0;
+    for (let index = 1; index < pixels.length; index++) {
+      const [x1, y1] = pixels[index - 1];
+      const [x2, y2] = pixels[index];
+      const length = Math.hypot(x2 - x1, y2 - y1);
+      let along = 0;
+      while (along < length) {
+        const position = phase % (on + off);
+        const step = Math.min(position < on ? on - position : on + off - position, length - along);
+        if (position < on && step > 0.2) {
+          const from = along / length;
+          const to = (along + step) / length;
+          pieces.push(piece(x1 + (x2 - x1) * from, y1 + (y2 - y1) * from, x1 + (x2 - x1) * to, y1 + (y2 - y1) * to, 0));
+        }
+        along += step;
+        phase += step;
+      }
+    }
+    return pieces;
+  }, [points, width, height, xRange.min, xRange.max, yRange.min, yRange.max, lineWidth, dash]);
   return (
     <>
       {segments.map(({ rotate, ...box }, index) => (
@@ -116,7 +143,13 @@ export interface ChartLine {
   /** Full-resolution points for the tooltip; drawing thins them. */
   points: XY[];
   faint?: boolean;
+  dash?: Dash;
+  /** Drawn faded behind the rest while another run is highlighted. */
+  dim?: boolean;
 }
+
+/** Tooltip rows beyond this are summarized; the highlighted run is always listed. */
+const TOOLTIP_ROWS = 10;
 
 /** The 5th to 95th percentile of the values, like W&B's "ignore outliers"; the full extent for few points. */
 function robustExtent(values: number[]): { min: number; max: number } | null {
@@ -150,7 +183,11 @@ function ChartCardImpl({
 }) {
   const plotWidth = Math.max(0, width - 22);
   const [hover, setHover] = useState<number | null>(null);
-  const drawn = useMemo(() => lines.map((line) => ({ ...line, points: thin(line.points, segmentsPerLine) })), [lines, segmentsPerLine]);
+  // Faded lines go first so highlighted and normal ones draw on top of them.
+  const drawn = useMemo(
+    () => [...lines].sort((a, b) => Number(Boolean(b.dim)) - Number(Boolean(a.dim))).map((line) => ({ ...line, points: thin(line.points, segmentsPerLine) })),
+    [lines, segmentsPerLine],
+  );
   const xs = useMemo(() => extent(lines.flatMap((line) => [line.points[0]?.x, line.points[line.points.length - 1]?.x].filter((x): x is number => x !== undefined))), [lines]);
   const ys = useMemo(() => {
     const values = lines.flatMap((line) => line.points.map((point) => point.y));
@@ -179,7 +216,7 @@ function ChartCardImpl({
     const rows = solid
       .map((line) => ({ line, point: nearest(line.points, snapped!) }))
       .filter((row): row is { line: ChartLine; point: XY } => row.point !== null && Math.abs(row.point.x - snapped!) <= Math.max(span * 0.02, 1e-9))
-      .sort((a, b) => b.point.y - a.point.y);
+      .sort((a, b) => Number(Boolean(a.line.dim)) - Number(Boolean(b.line.dim)) || b.point.y - a.point.y);
     const left = xRange.max === xRange.min ? plotWidth / 2 : ((snapped - xRange.min) / (xRange.max - xRange.min)) * plotWidth;
     return { x: snapped, left, rows };
   }, [hover, solid, xs, xRange.min, xRange.max, plotWidth, span]);
@@ -234,8 +271,9 @@ function ChartCardImpl({
                 color={line.color}
                 xRange={xRange}
                 yRange={yRange}
-                lineWidth={line.faint ? 1 : 1.5}
-                opacity={line.faint ? 0.3 : 1}
+                lineWidth={line.faint ? 1 : line.dash === "dotted" ? 2 : 1.5}
+                opacity={line.dim ? 0.15 : line.faint ? 0.3 : 1}
+                dash={line.dash}
               />
             ))}
           </View>
@@ -269,15 +307,16 @@ function ChartCardImpl({
               <Text style={{ ...muted, fontSize: 11 }}>
                 {xName} {showX(readout.x)}
               </Text>
-              {readout.rows.map(({ line, point }) => (
+              {readout.rows.slice(0, TOOLTIP_ROWS).map(({ line, point }) => (
                 <View key={line.id} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                  <View style={{ width: 10, height: 2, borderRadius: 1, backgroundColor: line.color }} />
+                  <LineKey color={line.color} dash={line.dash} width={12} />
                   <Text style={{ color: theme.colors.foreground, fontSize: 11, fontWeight: "600", fontVariant: ["tabular-nums"] }}>{showY(point.y)}</Text>
                   <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11, flexShrink: 1 }}>
                     {line.label}
                   </Text>
                 </View>
               ))}
+              {readout.rows.length > TOOLTIP_ROWS ? <Text style={{ ...muted, fontSize: 11 }}>+{readout.rows.length - TOOLTIP_ROWS} more</Text> : null}
             </View>
           </>
         ) : null}

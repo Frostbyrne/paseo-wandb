@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Text, View } from "react-native";
 import type { Scalar, WandbRun } from "../shared/wandb";
 import { Field, LineKey } from "./controls";
+import type { Dash } from "./model";
 import { metricMatcher } from "./series";
 import { duration } from "./state";
 
@@ -60,12 +61,14 @@ export function CompareTable({
   runs,
   labels,
   colors,
+  dashes,
   diffOnly,
 }: {
   theme: PluginTheme;
   runs: WandbRun[];
   labels: Map<string, string>;
   colors: Map<string, string>;
+  dashes?: Map<string, Dash>;
   diffOnly: boolean;
 }) {
   const [search, setSearch] = useState("");
@@ -93,7 +96,7 @@ export function CompareTable({
             <Text style={{ ...muted, ...cell, width: KEY_WIDTH, fontWeight: "600" }}>Key</Text>
             {runs.map((run) => (
               <View key={run.key} style={{ ...cell, flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <LineKey color={colors.get(run.key) ?? theme.colors.foregroundMuted} />
+                <LineKey color={colors.get(run.key) ?? theme.colors.foregroundMuted} dash={dashes?.get(run.key)} />
                 <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 12, fontWeight: "600", flexShrink: 1 }}>
                   {labels.get(run.key) ?? run.name}
                 </Text>

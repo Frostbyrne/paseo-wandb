@@ -7,12 +7,14 @@ import { isActive, isLive, type RunHistory, runHistoryRpc, type Series, type Wan
 import { ChartCard, type ChartLine, ChartGrid } from "./chart";
 import { CompareTable } from "./compare";
 import { Chip, Field, LineKey, Segmented, Slider, Toggle } from "./controls";
-import { type ChartPrefs, runLabels, type Selection, seriesColor } from "./model";
+import { type ChartPrefs, type Dash, runLabels, type Selection, seriesColor, seriesDash } from "./model";
 import { HealthBadges, LiveLine, LogsView, StopButton } from "./live";
+import { MediaPane } from "./media";
 import { aggregate, extent, metricMatcher, smooth, toLog, toXY, type XY } from "./series";
 import { formatValue, stateColor, stateText, useNow } from "./state";
 
 const CHARTS_PER_SECTION = 6;
+const LIVE_ROWS = 4;
 const POLL_MS = 15_000;
 const STEP_WINDOWS = [100, 1_000, 10_000, 100_000];
 const TIME_WINDOWS = [300, 900, 3_600, 21_600];
@@ -22,6 +24,7 @@ interface Entity {
   id: string;
   label: string;
   color: string;
+  dash: Dash;
   runKeys: string[];
 }
 
@@ -79,12 +82,14 @@ function chartLines(
   histories: Map<string, RunHistory>,
   prefs: ChartPrefs,
   windowStart: number | null,
+  highlight: string | null,
 ): ChartLine[] {
   const lines: ChartLine[] = [];
   const inWindow = (points: XY[]) => (windowStart === null ? points : points.filter((point) => point.x >= windowStart));
   // Faint raw lines under smoothed ones help with a few runs and only add clutter beyond that.
   const showRaw = prefs.smoothing > 0 && entities.length <= 3;
   for (const entity of entities) {
+    const style = { color: entity.color, dash: entity.dash, dim: highlight !== null && entity.id !== highlight };
     const members = entity.runKeys.map((runKey) => {
       const series = seriesFor(histories.get(runKey), key, system);
       const points = series ? inWindow(toXY(series.points, prefs.xAxis)) : [];
@@ -93,15 +98,15 @@ function chartLines(
     if (entity.runKeys.length === 1) {
       const raw = members[0];
       if (raw.length === 0) continue;
-      if (showRaw) lines.push({ id: `${entity.id}:raw`, label: entity.label, color: entity.color, points: raw, faint: true });
-      lines.push({ id: entity.id, label: entity.label, color: entity.color, points: smooth(raw, prefs.smoothing) });
+      if (showRaw) lines.push({ id: `${entity.id}:raw`, label: entity.label, ...style, points: raw, faint: true });
+      lines.push({ id: entity.id, label: entity.label, ...style, points: smooth(raw, prefs.smoothing) });
     } else {
       const { mean, min, max } = aggregate(members);
       if (mean.length === 0) continue;
       const smoothed = (points: XY[]) => smooth(points, prefs.smoothing);
-      lines.push({ id: `${entity.id}:min`, label: `${entity.label} min`, color: entity.color, points: smoothed(min), faint: true });
-      lines.push({ id: `${entity.id}:max`, label: `${entity.label} max`, color: entity.color, points: smoothed(max), faint: true });
-      lines.push({ id: entity.id, label: `${entity.label} mean`, color: entity.color, points: smoothed(mean) });
+      lines.push({ id: `${entity.id}:min`, label: `${entity.label} min`, ...style, points: smoothed(min), faint: true });
+      lines.push({ id: `${entity.id}:max`, label: `${entity.label} max`, ...style, points: smoothed(max), faint: true });
+      lines.push({ id: entity.id, label: `${entity.label} mean`, ...style, points: smoothed(mean) });
     }
   }
   return lines;
@@ -115,16 +120,18 @@ function MetricChart(props: {
   histories: Map<string, RunHistory>;
   prefs: ChartPrefs;
   windowStart: number | null;
+  highlight: string | null;
   width: number;
 }) {
-  const { theme, metric, system, entities, histories, prefs, width } = props;
+  const { theme, metric, system, entities, histories, prefs, width, highlight } = props;
   // System metrics have no steps, so a step window does not apply to them.
   const windowStart = system && prefs.xAxis === "step" ? null : props.windowStart;
   const lines = useMemo(
-    () => chartLines(metric, system, entities, histories, prefs, windowStart),
-    [metric, system, entities, histories, prefs, windowStart],
+    () => chartLines(metric, system, entities, histories, prefs, windowStart, highlight),
+    [metric, system, entities, histories, prefs, windowStart, highlight],
   );
-  const divisor = entities.length <= 2 ? 4 : entities.length <= 4 ? 6 : 8;
+  // More lines get fewer segments each, so many-run charts stay quick to draw.
+  const divisor = entities.length <= 2 ? 4 : entities.length <= 4 ? 6 : entities.length <= 8 ? 8 : 12;
   return (
     <ChartCard
       theme={theme}
@@ -148,6 +155,7 @@ function Section(props: {
   histories: Map<string, RunHistory>;
   prefs: ChartPrefs;
   windowStart: number | null;
+  highlight: string | null;
   compact: boolean;
 }) {
   const { theme, title, metrics, compact } = props;
@@ -196,6 +204,7 @@ function Charts({
   entities,
   prefs,
   onPrefs,
+  highlight,
 }: {
   theme: PluginTheme;
   compact: boolean;
@@ -203,6 +212,7 @@ function Charts({
   entities: Entity[];
   prefs: ChartPrefs;
   onPrefs: (prefs: ChartPrefs) => void;
+  highlight: string | null;
 }) {
   const { histories, pending, errors } = useHistories(runs);
   // The window ends at the newest point of any run, so every chart shows the same stretch and follows new data.
@@ -232,7 +242,7 @@ function Charts({
   const omitted = Math.max(0, ...[...histories.values()].map((history) => history.omittedKeys));
   const shownMetrics = metricKeys.filter(matches);
   const shownSystem = systemKeys.filter(matches);
-  const common = { theme, entities, histories, prefs, windowStart, compact };
+  const common = { theme, entities, histories, prefs, windowStart, highlight, compact };
   const muted = { color: theme.colors.foregroundMuted, fontSize: 12 };
   return (
     <View style={{ gap: 18 }}>
@@ -267,24 +277,29 @@ function LiveStrip({
   runs,
   labels,
   colors,
+  dashes,
   onLogs,
 }: {
   theme: PluginTheme;
   runs: WandbRun[];
   labels: Map<string, string>;
   colors: Map<string, string>;
+  dashes: Map<string, Dash>;
   onLogs: (key: string) => void;
 }) {
   const now = useNow(15_000);
-  const live = runs.filter(isLive);
-  if (live.length === 0) return null;
+  const [expanded, setExpanded] = useState(false);
+  // Running runs first; past a few rows the strip folds so the charts stay in view.
+  const all = runs.filter(isLive).sort((a, b) => Number(isActive(b)) - Number(isActive(a)));
+  const live = expanded ? all : all.slice(0, LIVE_ROWS);
+  if (all.length === 0) return null;
   const link = { color: theme.colors.accent, fontSize: 12, fontWeight: "600" as const };
   return (
     <View style={{ gap: 8, padding: 10, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
       {live.map((run) => (
         <View key={run.key} style={{ gap: 4 }}>
           <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
-            <LineKey color={colors.get(run.key) ?? theme.colors.foregroundMuted} />
+            <LineKey color={colors.get(run.key) ?? theme.colors.foregroundMuted} dash={dashes.get(run.key)} />
             <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 12, fontWeight: "600", flexShrink: 1 }}>
               {labels.get(run.key) ?? run.name}
             </Text>
@@ -300,6 +315,11 @@ function LiveStrip({
           <HealthBadges theme={theme} run={run} />
         </View>
       ))}
+      {all.length > LIVE_ROWS ? (
+        <Pressable accessibilityRole="button" onPress={() => setExpanded(!expanded)}>
+          <Text style={link}>{expanded ? "Show fewer" : `Show all ${all.length} live runs`}</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -309,6 +329,7 @@ function Logs({
   runs,
   labels,
   colors,
+  dashes,
   selectedKey,
   onSelect,
 }: {
@@ -316,6 +337,7 @@ function Logs({
   runs: WandbRun[];
   labels: Map<string, string>;
   colors: Map<string, string>;
+  dashes: Map<string, Dash>;
   selectedKey: string | null;
   onSelect: (key: string) => void;
 }) {
@@ -331,6 +353,7 @@ function Logs({
               theme={theme}
               label={labels.get(candidate.key) ?? candidate.name}
               color={colors.get(candidate.key)}
+              dash={dashes.get(candidate.key)}
               status={stateColor(candidate, theme, now)}
               selected={candidate.key === run.key}
               onPress={() => onSelect(candidate.key)}
@@ -368,11 +391,12 @@ export function Explorer({
     [runs, selection],
   );
   const colors = useMemo(() => new Map(selection.map((entry) => [entry.key, seriesColor(theme, entry.slot)])), [selection, theme]);
+  const dashes = useMemo(() => new Map(selection.map((entry) => [entry.key, seriesDash(entry.slot)])), [selection]);
   const groupKeys = useMemo(() => differingConfigKeys(ordered), [ordered]);
   const groupBy = prefs.groupBy === "group" || prefs.groupBy === "jobType" || groupKeys.includes(prefs.groupBy.slice(7)) ? prefs.groupBy : "";
   const labels = useMemo(() => runLabels(ordered), [ordered]);
   const entities = useMemo<Entity[]>(() => {
-    if (!groupBy) return ordered.map((run) => ({ id: run.key, label: labels.get(run.key)!, color: colors.get(run.key)!, runKeys: [run.key] }));
+    if (!groupBy) return ordered.map((run) => ({ id: run.key, label: labels.get(run.key)!, color: colors.get(run.key)!, dash: dashes.get(run.key)!, runKeys: [run.key] }));
     const groups = new Map<string, string[]>();
     for (const run of ordered) {
       const value = groupValue(run, groupBy);
@@ -383,12 +407,17 @@ export function Explorer({
       id: `group:${value}`,
       label: `${name}=${value}`,
       color: seriesColor(theme, index),
+      dash: seriesDash(index),
       runKeys,
     }));
-  }, [ordered, groupBy, colors, labels, theme]);
+  }, [ordered, groupBy, colors, dashes, labels, theme]);
+  // Pressing a legend entry highlights its lines and fades the rest; pressing it again clears that.
+  const [picked, setPicked] = useState<string | null>(null);
+  const highlight = entities.some((entity) => entity.id === picked) ? picked : null;
   const set = (patch: Partial<ChartPrefs>) => onPrefs({ ...prefs, ...patch });
   const muted = { color: theme.colors.foregroundMuted, fontSize: 12 };
   const [logsKey, setLogsKey] = useState<string | null>(null);
+  const [mediaKey, setMediaKey] = useState<string | null>(null);
 
   if (ordered.length === 0) {
     return <Text style={{ ...muted, fontSize: 13, paddingVertical: 8 }}>Pick runs to chart and compare them.</Text>;
@@ -402,6 +431,7 @@ export function Explorer({
           value={prefs.view}
           options={[
             { value: "charts", label: "Charts" },
+            { value: "media", label: "Media" },
             { value: "logs", label: "Logs" },
             { value: "table", label: "Compare table" },
           ]}
@@ -450,11 +480,19 @@ export function Explorer({
         <View accessibilityLabel="Legend" style={{ flexDirection: "row", flexWrap: "wrap", gap: 12 }}>
           {entities.map((entity) => (
             <View key={entity.id} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <LineKey color={entity.color} width={16} />
-              <Text style={{ color: theme.colors.foreground, fontSize: 12 }} numberOfLines={1}>
-                {entity.label}
-                {entity.runKeys.length > 1 ? ` (${entity.runKeys.length} runs)` : ""}
-              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ selected: highlight === entity.id }}
+                accessibilityLabel={`${highlight === entity.id ? "Stop highlighting" : "Highlight"} ${entity.label}`}
+                onPress={() => setPicked(highlight === entity.id ? null : entity.id)}
+                style={{ flexDirection: "row", alignItems: "center", gap: 6, opacity: highlight && highlight !== entity.id ? 0.45 : 1 }}
+              >
+                <LineKey color={entity.color} dash={entity.dash} width={16} />
+                <Text style={{ color: theme.colors.foreground, fontSize: 12, fontWeight: highlight === entity.id ? "600" : "400" }} numberOfLines={1}>
+                  {entity.label}
+                  {entity.runKeys.length > 1 ? ` (${entity.runKeys.length} runs)` : ""}
+                </Text>
+              </Pressable>
               {onRemove && entity.runKeys.length === 1 ? (
                 <Pressable accessibilityRole="button" accessibilityLabel={`Stop comparing ${entity.label}`} onPress={() => onRemove(entity.id)} hitSlop={6}>
                   <Text style={muted}>×</Text>
@@ -469,17 +507,20 @@ export function Explorer({
         runs={ordered}
         labels={labels}
         colors={colors}
+        dashes={dashes}
         onLogs={(key) => {
           setLogsKey(key);
           set({ view: "logs" });
         }}
       />
       {prefs.view === "charts" ? (
-        <Charts theme={theme} compact={compact} runs={ordered} entities={entities} prefs={prefs} onPrefs={onPrefs} />
+        <Charts theme={theme} compact={compact} runs={ordered} entities={entities} prefs={prefs} onPrefs={onPrefs} highlight={highlight} />
+      ) : prefs.view === "media" ? (
+        <MediaPane theme={theme} compact={compact} runs={ordered} labels={labels} colors={colors} selectedKey={mediaKey} onSelect={setMediaKey} />
       ) : prefs.view === "logs" ? (
-        <Logs theme={theme} runs={ordered} labels={labels} colors={colors} selectedKey={logsKey} onSelect={setLogsKey} />
+        <Logs theme={theme} runs={ordered} labels={labels} colors={colors} dashes={dashes} selectedKey={logsKey} onSelect={setLogsKey} />
       ) : (
-        <CompareTable theme={theme} runs={ordered} labels={labels} colors={colors} diffOnly={prefs.diffOnly} />
+        <CompareTable theme={theme} runs={ordered} labels={labels} colors={colors} dashes={dashes} diffOnly={prefs.diffOnly} />
       )}
     </View>
   );
